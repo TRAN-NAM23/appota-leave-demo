@@ -18,6 +18,7 @@ uvicorn app.main:app --reload
 ```
 
 Mở http://127.0.0.1:8000
+Mở https://appota-leave-demo-msgo.vercel.app/
 
 Ngày mặc định trên giao diện là 08/10/2026. Persona được chọn ở giao diện; server tra hồ sơ trong SQLite và không nhận role từ client. Tab Tài liệu và Cây tổ chức chỉ trả tài liệu persona đó được đọc. Thêm hoặc xóa tài liệu cần persona Admin.
 
