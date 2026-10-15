@@ -58,6 +58,14 @@ CREATE TABLE IF NOT EXISTS chunks (
     position INTEGER NOT NULL,
     text TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS chunk_embeddings (
+    version_id TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    text_hash TEXT NOT NULL,
+    model TEXT NOT NULL,
+    vector TEXT NOT NULL,
+    PRIMARY KEY (version_id, position)
+);
 CREATE TABLE IF NOT EXISTS acl_exceptions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT NOT NULL,
@@ -106,6 +114,48 @@ def _migrate(connection: sqlite3.Connection) -> None:
 
 def _iso(value: date | None) -> str | None:
     return value.isoformat() if value else None
+
+
+def load_statement_embeddings(path: Path) -> dict[tuple[str, int], tuple[str, str, list[float]]]:
+    connection = connect(path)
+    try:
+        rows = connection.execute(
+            "SELECT version_id, position, text_hash, model, vector FROM chunk_embeddings"
+        )
+        return {
+            (row["version_id"], row["position"]): (
+                row["text_hash"],
+                row["model"],
+                json.loads(row["vector"]),
+            )
+            for row in rows
+        }
+    finally:
+        connection.close()
+
+
+def save_statement_embeddings(path: Path, rows: list[tuple[str, int, str, str, list[float]]]) -> None:
+    if not rows:
+        return
+    connection = connect(path)
+    try:
+        connection.executemany(
+            """
+            INSERT INTO chunk_embeddings (version_id, position, text_hash, model, vector)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(version_id, position) DO UPDATE SET
+                text_hash = excluded.text_hash,
+                model = excluded.model,
+                vector = excluded.vector
+            """,
+            [
+                (version_id, position, text_hash, model, json.dumps(vector))
+                for version_id, position, text_hash, model, vector in rows
+            ],
+        )
+        connection.commit()
+    finally:
+        connection.close()
 
 
 def ensure_database(path: Path) -> None:

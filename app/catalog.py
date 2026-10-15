@@ -69,8 +69,16 @@ def document_detail(corpus: Corpus, version_id: str) -> dict | None:
         "owner_org": document.owner_org,
         "owner_name": owner.name if owner else document.owner_org,
         "classification": document.classification,
+        "audience_orgs": list(document.audience_orgs),
+        "audience_type": document.audience_type,
+        "allowed_contract_types": list(document.allowed_contract_types),
+        "required_role": document.required_role or "",
         "effective_from": document.effective_from.isoformat(),
         "effective_to": document.effective_to.isoformat() if document.effective_to else None,
+        "override_mode": document.override_mode,
+        "supplement_target": document.supplement_target,
+        "supersedes": document.supersedes,
+        "match_phrases": list(document.match_phrases),
         "content": document.content,
     }
 
@@ -88,9 +96,14 @@ AUDIENCE_LABELS = {
 }
 
 
-def org_tree(corpus: Corpus) -> dict:
+def org_tree(corpus: Corpus, allowed_version_ids: set[str] | None = None) -> dict:
+    visible = [
+        document
+        for document in corpus.documents
+        if allowed_version_ids is None or document.version_id in allowed_version_ids
+    ]
     by_audience: dict[str, list[Document]] = {org_id: [] for org_id in corpus.orgs}
-    for document in corpus.documents:
+    for document in visible:
         for audience in document.audience_orgs:
             if audience in by_audience:
                 by_audience[audience].append(document)
@@ -124,7 +137,7 @@ def org_tree(corpus: Corpus) -> dict:
     for kind, label in KIND_LABELS.items():
         covered = {
             document.version_id
-            for document in corpus.documents
+            for document in visible
             if _audience_kind(corpus, document, kind)
         }
         levels.append(
@@ -161,7 +174,7 @@ def _tree_document(corpus: Corpus, document: Document) -> dict:
     }
 
 
-def document_summaries(corpus: Corpus) -> list[dict]:
+def document_summaries(corpus: Corpus, allowed_version_ids: set[str] | None = None) -> list[dict]:
     return [
         {
             "version_id": document.version_id,
@@ -173,6 +186,7 @@ def document_summaries(corpus: Corpus) -> list[dict]:
             "owner_org": document.owner_org,
         }
         for document in corpus.documents
+        if allowed_version_ids is None or document.version_id in allowed_version_ids
     ]
 
 

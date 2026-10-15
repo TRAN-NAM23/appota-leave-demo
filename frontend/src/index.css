@@ -103,7 +103,9 @@ h1 { font-size: 28px; letter-spacing: -0.03em; white-space: nowrap; }
 
 .panel { padding: 18px; display: grid; gap: 14px; position: sticky; top: 16px; }
 
-.lede { color: var(--muted); }
+.library-head { display: flex; justify-content: space-between; gap: 16px; align-items: end; }
+.library-head h2 { margin: 0; }
+.library-head label { min-width: 240px; }
 
 label { display: grid; gap: 6px; color: var(--muted); font-size: 13px; }
 
@@ -226,9 +228,13 @@ select[multiple] { min-height: 148px; }
   cursor: pointer;
 }
 
-.doc-row:hover { background: #f7f1e8; }
+.doc-row:hover, .doc-row.active { background: #f7f1e8; }
 
 .reader { display: grid; gap: 10px; align-content: start; }
+.reader fieldset { margin: 0; border: 0; padding: 0; min-width: 0; }
+.reader fieldset:disabled input,
+.reader fieldset:disabled select,
+.reader fieldset:disabled textarea { opacity: 1; color: inherit; }
 
 .reading {
   white-space: pre-wrap;

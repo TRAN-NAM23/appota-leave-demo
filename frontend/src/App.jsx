@@ -31,17 +31,34 @@ export default function App() {
   const [error, setError] = useState("")
   const [busy, setBusy] = useState(false)
   const [focusId, setFocusId] = useState(null)
+  const [libraryId, setLibraryId] = useState("lan")
+
+  const libraryPersona = personas.find((persona) => persona.id === libraryId)
+  const canManage = Boolean(libraryPersona?.roles.includes("policy_admin"))
+
+  function libraryQuery(personaId = libraryId, on = asOf) {
+    return new URLSearchParams({ persona_id: personaId, as_of: on }).toString()
+  }
+
+  function openLibrary(versionId, personaId) {
+    setLibraryId(personaId)
+    setFocusId(versionId)
+    setView("docs")
+    loadDocuments(personaId, asOf)
+  }
 
   async function deleteDocument(versionId) {
-    await remove(`/api/documents/${encodeURIComponent(versionId)}`)
+    const params = new URLSearchParams({ persona_id: libraryId })
+    await remove(`/api/documents/${encodeURIComponent(versionId)}?${params}`)
     if (focusId === versionId) setFocusId(null)
     await loadDocuments()
   }
 
-  async function loadDocuments() {
+  async function loadDocuments(personaId = libraryId, on = asOf) {
+    const query = libraryQuery(personaId, on)
     const [docs, tree] = await Promise.all([
-      request("/api/documents"),
-      request("/api/org-tree"),
+      request(`/api/documents?${query}`),
+      request(`/api/org-tree?${query}`),
     ])
     setDocuments(docs)
     setOrgTree(tree)
@@ -79,7 +96,13 @@ export default function App() {
   }
 
   useEffect(() => {
-    Promise.all([request("/api/personas"), request("/api/catalog"), request("/api/documents"), request("/api/org-tree")])
+    const query = new URLSearchParams({ persona_id: "lan", as_of: "2026-10-08" }).toString()
+    Promise.all([
+      request("/api/personas"),
+      request("/api/catalog"),
+      request(`/api/documents?${query}`),
+      request(`/api/org-tree?${query}`),
+    ])
       .then(([people, options, docs, tree]) => {
         setPersonas(people)
         setCatalog(options)
@@ -138,18 +161,38 @@ export default function App() {
             ) : null}
             {left && right ? (
               <>
-                <AnswerCard result={left} onOpen={(versionId) => { setFocusId(versionId); setView("docs") }} />
-                <AnswerCard result={right} onOpen={(versionId) => { setFocusId(versionId); setView("docs") }} />
+                <AnswerCard result={left} onOpen={(versionId) => openLibrary(versionId, left.persona.id)} />
+                <AnswerCard result={right} onOpen={(versionId) => openLibrary(versionId, right.persona.id)} />
               </>
             ) : !error ? <div className="empty">Đang lấy câu trả lời...</div> : null}
           </section>
         </main>
       ) : view === "chat" ? (
-        <ChatDesk personas={personas} onOpen={(versionId) => { setFocusId(versionId); setView("docs") }} />
+        <ChatDesk personas={personas} onOpen={openLibrary} />
       ) : view === "tree" ? (
-        orgTree ? <OrgTree tree={orgTree} onOpen={(versionId) => { setFocusId(versionId); setView("docs") }} onDelete={deleteDocument} /> : <p className="banner error">Chưa tải được cây tổ chức.</p>
+        orgTree ? (
+          <OrgTree
+            tree={orgTree}
+            personas={personas}
+            personaId={libraryId}
+            canManage={canManage}
+            onPersonaChange={(id) => { setFocusId(null); setLibraryId(id); loadDocuments(id, asOf) }}
+            onOpen={(versionId) => openLibrary(versionId, libraryId)}
+            onDelete={deleteDocument}
+          />
+        ) : <p className="banner error">Chưa tải được cây tổ chức.</p>
       ) : catalog ? (
-        <DocumentDesk catalog={catalog} documents={documents} onSaved={loadDocuments} focusId={focusId} />
+        <DocumentDesk
+          catalog={catalog}
+          documents={documents}
+          personas={personas}
+          personaId={libraryId}
+          asOf={asOf}
+          canManage={canManage}
+          onPersonaChange={(id) => { setFocusId(null); setLibraryId(id); loadDocuments(id, asOf) }}
+          onSaved={() => loadDocuments()}
+          focusId={focusId}
+        />
       ) : <p className="banner error">Chưa tải được danh mục tài liệu.</p>}
     </div>
   )

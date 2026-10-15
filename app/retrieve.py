@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from datetime import date
 
+from app.embed import cosine
 from app.models import Document, User
 from app.policy import CURRENT_STATUSES, Decision, PolicyEngine
 
@@ -27,12 +28,43 @@ def readable_effective(engine: PolicyEngine, user: User, on: date) -> list[Docum
         access = engine.can_read(user, document, "read", on)
         if not access.allowed or document.status not in CURRENT_STATUSES:
             continue
+        if not engine.applies(user, document):
+            continue
         if document.effective_from > on:
             continue
         if document.effective_to is not None and document.effective_to < on:
             continue
         selected.append(document)
     return selected
+
+
+def rank_statements(
+    documents: list[Document],
+    question: str,
+    vectors: dict[tuple[str, int], list[float]],
+    query_vector: list[float] | None,
+    limit: int = 4,
+    floor: float = 0.0,
+) -> tuple[str, list[tuple[float, str, Document]]]:
+    scored: list[tuple[float, str, Document]] = []
+    terms = query_terms(question) or tokens(question)
+    for document in documents:
+        vector = vectors.get((document.version_id, 0))
+        if query_vector is not None and vector is not None:
+            score = cosine(query_vector, vector)
+            method = "embedding"
+            if score < floor:
+                continue
+        else:
+            text = f"{document.title} {document.statement}".casefold()
+            score = float(sum(1 for term in terms if term in text))
+            method = "keyword"
+        scored.append((score, method, document))
+    if query_vector is not None and not any(method == "embedding" for _score, method, _document in scored):
+        return rank_statements(documents, question, {}, None, limit, 0.0)
+    scored.sort(key=lambda item: item[0], reverse=True)
+    method = scored[0][1] if scored else ("embedding" if query_vector is not None else "keyword")
+    return method, scored[:limit]
 
 
 def passages_for_question(
@@ -98,15 +130,11 @@ def chunks_for_answer(
     on: date,
     decision: Decision,
 ) -> list[str]:
+    del engine, user, question, on
     if decision.outcome != "answered" or decision.winner is None:
         return []
-    allowed = {decision.winner.key, *[document.key for document in decision.supplements]}
-    selected: list[str] = []
-    for document, chunk, _score in keyword_search(engine, user, question, on, decision.winner.topic):
-        if document.key not in allowed or chunk in selected:
-            continue
-        selected.append(chunk)
-    for document in [decision.winner, *decision.supplements]:
+    selected = [decision.winner.statement]
+    for document in decision.supplements:
         if document.statement not in selected:
-            selected.insert(0, document.statement)
+            selected.append(document.statement)
     return selected

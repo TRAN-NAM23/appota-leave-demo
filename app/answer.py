@@ -3,11 +3,13 @@ from __future__ import annotations
 import re
 from datetime import date
 
+from app.catalog import TOPIC_LABELS
 from app.db import write_audit
+from app.embed import embed_texts, ensure_statement_embeddings
 from app.llm import complete
 from app.models import Document, User
 from app.policy import Decision, PolicyEngine
-from app.retrieve import chunks_for_answer, passages_for_question
+from app.retrieve import chunks_for_answer, passages_for_question, query_terms, rank_statements, readable_effective
 
 
 REASON_LABELS = {
@@ -23,6 +25,8 @@ REASON_LABELS = {
     "denied": "Bị cấm bởi ngoại lệ",
     "not_yet_published": "Chưa tới ngày ban hành",
     "action_forbidden": "Hành động không được phép",
+    "superseded": "Đã có phiên bản mới hơn đang hiệu lực",
+    "unmatched_supplement": "Không bổ sung cho bản đang áp dụng",
 }
 
 TOPIC_RULES = (
@@ -38,6 +42,18 @@ TOPIC_RULES = (
 )
 
 DOC_ID_PATTERN = re.compile(r"\b[A-Z]+-[A-Z]+-\d+\b")
+ROLE_LABELS = {
+    "employee": "nhân viên",
+    "intern": "thực tập",
+    "manager": "quản lý",
+    "policy_admin": "quản trị chính sách",
+    "contractor": "cộng tác viên",
+}
+CONTRACT_LABELS = {
+    "full_time": "chính thức",
+    "intern": "thực tập",
+    "contractor": "cộng tác viên",
+}
 
 
 def detect_topic(
@@ -82,14 +98,37 @@ class AnswerService:
         chunks: list[str] = []
         cited_chunks: list[tuple[Document, str]] = []
         llm_used = False
+        steps = [self._identity_step(user)]
+        passages: list[dict] = []
         if topic is None:
             answer = "Bản demo này trả lời các câu hỏi về nghỉ phép, làm việc từ xa, lương và thưởng."
+            steps.extend([
+                {
+                    "tool": "classify",
+                    "title": "Chọn công cụ",
+                    "detail": "Câu hỏi không thuộc chủ đề có sẵn, nên tab này không truy xuất tài liệu.",
+                },
+                {
+                    "tool": "compose",
+                    "title": "Viết câu trả lời",
+                    "detail": "Không gọi LLM vì chưa xác định được chủ đề.",
+                },
+            ])
         else:
             decision = self.engine.resolve_effective(user, topic, on)
+            steps.append({
+                "tool": "classify",
+                "title": "Chọn công cụ",
+                "detail": f"Câu thuộc {TOPIC_LABELS.get(topic, topic)}. Policy chọn bản hiệu lực, RAG chỉ lấy đoạn trong tập đó.",
+            })
+            steps.append(self._policy_step(decision))
+            passages = self._policy_passages(question, decision)
+            steps.append(self._retrieve_step(passages))
             chunks = chunks_for_answer(self.engine, user, question, on, decision)
             cited_chunks = self._tag_chunks(decision, chunks)
             answer, llm_used = self._compose(question, decision, cited_chunks)
-        payload = self._public(user, question, on, topic, decision, answer, llm_used)
+            steps.append(self._compose_step(decision, llm_used))
+        payload = self._public(user, question, on, topic, decision, answer, llm_used, steps, passages)
         if self.db_path is not None:
             write_audit(
                 self.db_path,
@@ -111,6 +150,8 @@ class AnswerService:
                         {"document_id": document.document_id, "version": document.version, "reason": reason}
                         for document, reason in decision.visible_rejected
                     ],
+                    "steps": [step["tool"] for step in steps],
+                    "passages": [item["document_id"] for item in passages],
                 },
             )
         return payload
@@ -142,10 +183,39 @@ class AnswerService:
                 "as_of": payload["as_of"],
                 "question": question,
                 "llm_used": payload["llm_used"],
+                "steps": payload["steps"],
+                "passages": payload["passages"],
             }
 
-        passages = passages_for_question(self.engine, user, question, on)
-        cited = [(document, chunk) for document, chunk in passages]
+        allowed = readable_effective(self.engine, user, on)
+        vectors, query_vector = self._embedding_space(allowed, question)
+        method, ranked = rank_statements(allowed, question, vectors, query_vector, floor=0.28)
+        if method == "embedding":
+            cited = [(document, document.statement) for _score, _item_method, document in ranked]
+            passage_rows = [
+                self._passage(document, score, item_method, True)
+                for score, item_method, document in ranked
+            ]
+        else:
+            cited = passages_for_question(self.engine, user, question, on)
+            passage_rows = [
+                self._passage(
+                    document,
+                    float(sum(1 for term in (query_terms(question) or []) if term in f"{document.title} {chunk}".casefold())),
+                    "keyword",
+                    True,
+                )
+                for document, chunk in cited
+            ]
+        steps = [
+            self._identity_step(user),
+            {
+                "tool": "classify",
+                "title": "Chọn công cụ",
+                "detail": "Câu không thuộc chủ đề có sẵn. Agent tìm ngữ nghĩa trong tài liệu được xem và còn hiệu lực.",
+            },
+            self._retrieve_step(passage_rows),
+        ]
         if not cited:
             answer = (
                 "Chưa thấy căn cứ trong các tài liệu bạn được phép xem và còn hiệu lực. "
@@ -154,6 +224,11 @@ class AnswerService:
             reason = "Không có đoạn tài liệu được phép dùng cho câu hỏi này."
             outcome = "no_policy"
             llm_used = False
+            steps.append({
+                "tool": "compose",
+                "title": "Viết câu trả lời",
+                "detail": "Không gọi LLM vì không có đoạn được phép.",
+            })
         else:
             fallback = self._passages_fallback(cited)
             generated = complete(question, build_context(cited))
@@ -166,6 +241,11 @@ class AnswerService:
                 llm_used = False
             reason = "Các đoạn này thuộc tài liệu bạn được xem và còn hiệu lực vào ngày hỏi."
             outcome = "answered"
+            steps.append({
+                "tool": "compose",
+                "title": "Viết câu trả lời",
+                "detail": "LLM diễn đạt các đoạn RAG đã lấy." if llm_used else "Dùng câu trích từ các đoạn RAG đã lấy.",
+            })
         payload = {
             "mode": "passages",
             "outcome": outcome,
@@ -176,6 +256,8 @@ class AnswerService:
             "as_of": on.isoformat(),
             "question": question,
             "llm_used": llm_used,
+            "steps": steps,
+            "passages": passage_rows,
         }
         if self.db_path is not None:
             first = None if not cited else cited[0][0]
@@ -192,10 +274,100 @@ class AnswerService:
                 llm_used=llm_used,
                 detail={
                     "mode": "passages",
+                    "method": method,
                     "sources": [document.document_id for document, _chunk in cited],
+                    "steps": [step["tool"] for step in steps],
                 },
             )
         return payload
+
+    def _identity_step(self, user: User) -> dict:
+        roles = ", ".join(ROLE_LABELS.get(role.role, role.role) for role in user.roles)
+        contract = CONTRACT_LABELS.get(user.employment_type, user.employment_type)
+        return {
+            "tool": "identity",
+            "title": "Gắn danh tính",
+            "detail": f"{user.name} · {self.engine.corpus.org_name(user.org)} · {roles} · {contract} · mức {user.clearance}.",
+        }
+
+    def _policy_step(self, decision: Decision) -> dict:
+        hidden = len(decision.hidden_rejected)
+        hidden_note = f" Đã loại {hidden} tài liệu ngoài quyền xem." if hidden else ""
+        if decision.outcome == "answered" and decision.winner is not None:
+            detail = f"Chọn {decision.winner.document_id} phiên bản {decision.winner.version}.{hidden_note}"
+        elif decision.outcome == "conflict":
+            detail = f"Các bản cùng cấp đang xung đột, không tự chọn.{hidden_note}"
+        else:
+            detail = f"Không có tài liệu vừa được xem, vừa áp dụng, vừa còn hiệu lực.{hidden_note}"
+        return {"tool": "policy", "title": "Policy Engine", "detail": detail}
+
+    def _retrieve_step(self, passages: list[dict]) -> dict:
+        from app.embed import LAST_ERROR
+
+        if not passages:
+            detail = "Không có đoạn được phép để truy xuất."
+        elif passages[0]["method"] == "embedding":
+            detail = f"So embedding và lấy {len(passages)} đoạn gần nhất trong tập đã được phép."
+        elif LAST_ERROR == "http 429":
+            detail = f"Embedding đang bị giới hạn lượt gọi, nên xếp {len(passages)} đoạn theo từ khóa."
+        elif LAST_ERROR and LAST_ERROR != "no_key":
+            detail = f"Embedding chưa dùng được, nên xếp {len(passages)} đoạn theo từ khóa."
+        else:
+            detail = f"Chưa có vector, xếp {len(passages)} đoạn theo từ khóa trong tập đã được phép."
+        return {"tool": "retrieve", "title": "RAG", "detail": detail}
+
+    def _compose_step(self, decision: Decision, llm_used: bool) -> dict:
+        if decision.outcome != "answered":
+            detail = "Không gọi LLM vì chưa có một bản kết luận."
+        elif llm_used:
+            detail = "LLM chỉ diễn đạt các đoạn đã chọn."
+        else:
+            detail = "Dùng câu trích từ đoạn đã chọn."
+        return {"tool": "compose", "title": "Viết câu trả lời", "detail": detail}
+
+    def _policy_passages(self, question: str, decision: Decision) -> list[dict]:
+        used = [document for document in [decision.winner, *decision.supplements] if document is not None]
+        visible = [*used, *decision.overridden, *decision.conflicts]
+        if not visible:
+            return []
+        vectors, query_vector = self._embedding_space(visible, question)
+        _method, ranked = rank_statements(visible, question, vectors, query_vector)
+        used_ids = {document.version_id for document in used}
+        used_rows = []
+        other_rows = []
+        for score, method, document in ranked:
+            row = self._passage(document, score, method, document.version_id in used_ids)
+            if document.version_id in used_ids:
+                used_rows.append(row)
+            elif score > 0:
+                other_rows.append(row)
+        return (used_rows + other_rows)[:4]
+
+    def _embedding_space(self, documents: list[Document], question: str):
+        if not documents or self.db_path is None:
+            return {}, None
+        vectors = ensure_statement_embeddings(self.db_path, documents)
+        if not vectors or any((document.version_id, 0) not in vectors for document in documents):
+            return {}, None
+        query = embed_texts([question])
+        if not query:
+            return {}, None
+        return vectors, query[0]
+
+    def _passage(self, document: Document, score: float, method: str, used: bool) -> dict:
+        excerpt = " ".join(document.statement.split())
+        if len(excerpt) > 160:
+            excerpt = excerpt[:157] + "..."
+        shown = round(score, 2) if method == "embedding" else int(score)
+        return {
+            "document_id": document.document_id,
+            "version": document.version,
+            "title": document.title,
+            "excerpt": excerpt,
+            "score": shown,
+            "method": method,
+            "used": used,
+        }
 
     def _passages_fallback(self, cited: list[tuple[Document, str]]) -> str:
         lines = ["Trong các tài liệu bạn được xem, có những đoạn sau.", ""]
@@ -264,6 +436,8 @@ class AnswerService:
         decision: Decision,
         answer: str,
         llm_used: bool,
+        steps: list[dict] | None = None,
+        passages: list[dict] | None = None,
     ) -> dict:
         return {
             "outcome": decision.outcome if topic else "unknown_topic",
@@ -284,6 +458,8 @@ class AnswerService:
             "as_of": on.isoformat(),
             "question": question,
             "llm_used": llm_used,
+            "steps": steps or [],
+            "passages": passages or [],
         }
 
     def _winner_reason(self, decision: Decision) -> str:
@@ -294,7 +470,9 @@ class AnswerService:
         if decision.outcome != "answered":
             return "Câu hỏi chưa thuộc chủ đề mà bản demo đang hỗ trợ."
         if decision.supplements:
-            return "Quy định cấp trên là mức bắt buộc. Bản cấp dưới chỉ được bổ sung."
+            if decision.winner is not None and decision.winner.override_mode == "mandatory":
+                return "Quy định cấp trên là mức bắt buộc. Bản cấp dưới chỉ được bổ sung."
+            return "Bản đang áp dụng được giữ. Bản bổ sung chỉ thêm điều khoản."
         if decision.overridden:
             return "Bản của cấp gần người hỏi hơn đang có hiệu lực và thay bản cấp rộng hơn."
         return "Đây là bản đã ban hành, còn hiệu lực và áp dụng cho người hỏi."

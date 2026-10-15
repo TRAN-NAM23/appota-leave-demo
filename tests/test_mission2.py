@@ -38,14 +38,14 @@ def test_org_has_four_levels_and_sibling_units():
     assert {org.id for org in corpus.siblings("apx/apt/hr/payroll")} == {"apx/apt/hr/recruit"}
     assert {org.id for org in corpus.children("apx/har")} == {"apx/har/hr", "apx/har/ops"}
     assert len(corpus.users) >= 6
-    assert len(corpus.documents) == 18
+    assert len(corpus.documents) == 21
 
 
 def test_org_tree_shows_documents_at_every_level(tmp_path):
+    from app.catalog import org_tree
     from app.main import app, init_state
 
-    init_state(tmp_path / "demo.sqlite")
-    payload = TestClient(app).get("/api/org-tree").json()
+    payload = org_tree(build_corpus())
     counts = {level["kind"]: level["documents"] for level in payload["levels"]}
     assert counts["group"] >= 1
     assert counts["company"] >= 1
@@ -69,7 +69,27 @@ def test_org_tree_shows_documents_at_every_level(tmp_path):
     assert any(item["document_id"] == "APT-LV-014" for item in company["documents"])
     assert any(item["document_id"] == "APT-ENG-010" for item in department["documents"])
     assert any(item["document_id"] == "APT-PAY-010" for item in team["documents"])
-    assert find(payload["tree"], "apx/apt/hr/recruit")["documents"] == []
+    assert any(item["document_id"] == "APT-REC-001" for item in find(payload["tree"], "apx/apt/hr/recruit")["documents"])
+    assert any(item["document_id"] == "HAR-HR-001" for item in find(payload["tree"], "apx/har/hr")["documents"])
+    assert any(item["document_id"] == "HAR-OPS-001" for item in find(payload["tree"], "apx/har/ops")["documents"])
+
+    def every_unit(nodes):
+        for node in nodes:
+            assert node["documents"], node["id"]
+            every_unit(node["children"])
+
+    every_unit(payload["tree"])
+
+    init_state(tmp_path / "demo.sqlite")
+    client = TestClient(app)
+    lan = client.get("/api/org-tree", params={"persona_id": "lan"}).json()
+    visible = str(lan)
+    assert "APT-LV-014" in visible
+    assert "APT-PAY-010" in visible
+    assert "HAR-LV-009" not in visible
+    assert "APT-PAY-200" not in visible
+    assert "APT-LV-014-v4" not in visible
+    assert client.get("/api/org-tree").status_code == 422
 
 
 def test_lan_and_minh_receive_different_leave_answers():
@@ -165,8 +185,12 @@ def test_manager_remote_rule_is_not_visible_to_employee():
     hoa = service.ask(user(corpus, "hoa"), question, ASK)
     lan = service.ask(user(corpus, "lan"), question, ASK)
 
-    assert hoa["winner"]["document_id"] == "APT-RW-020"
+    assert hoa["winner"]["document_id"] == "APX-RW-001"
+    assert hoa["winner"]["version"] == 2
+    assert hoa["supplements"][0]["document_id"] == "APT-RW-020"
+    assert "2 ngày" in hoa["answer"]
     assert "đột xuất" in hoa["answer"]
+    assert "bắt buộc" not in hoa["reason"]
     assert "đột xuất" not in lan["answer"]
 
 
@@ -228,6 +252,7 @@ def test_mandatory_floor_keeps_the_company_rule_as_supplement():
     assert lan["winner"]["document_id"] == "APX-LV-050"
     assert lan["supplements"][0]["document_id"] == "APT-LV-051"
     assert "không thấp hơn" in lan["answer"]
+    assert "bắt buộc" in lan["reason"]
     assert minh["winner"]["document_id"] == "APX-LV-050"
     assert minh["supplements"] == []
     assert "APT-LV-051" not in minh["answer"]
@@ -313,10 +338,10 @@ def test_compare_api_uses_the_policy_engine(tmp_path):
     assert payload["right"]["winner"]["document_id"] == "HAR-LV-009"
     assert payload["left"]["llm_used"] is False
     assert citations_ok(payload["left"]["answer"], {"APT-LV-014", "APX-LV-001"})
-    detail = client.get("/api/documents/APT-LV-014-v3")
+    detail = client.get("/api/documents/APT-LV-014-v3", params={"persona_id": "lan"})
     assert detail.status_code == 200
     assert "14 ngày" in detail.json()["content"]
-    assert client.get("/api/documents/KHONG-CO-999").status_code == 404
+    assert client.get("/api/documents/KHONG-CO-999", params={"persona_id": "lan"}).status_code == 404
 
 
 NEW_DOCUMENT = {
@@ -333,7 +358,40 @@ NEW_DOCUMENT = {
     "effective_from": "2026-01-01",
     "override_mode": "default",
     "content": "Nhân viên chính thức Phòng Kỹ thuật được 15 ngày nghỉ phép năm.",
+    "persona_id": "admin",
 }
+
+
+def test_embedding_rank_prefers_the_closer_statement():
+    from app.retrieve import rank_statements
+
+    corpus = build_corpus()
+    har = document(corpus, "HAR-LV-009", 1)
+    payroll = document(corpus, "APT-PAY-010", 1)
+    method, ranked = rank_statements(
+        [payroll, har],
+        "ca kíp",
+        {
+            (har.version_id, 0): [0.9, 0.1],
+            (payroll.version_id, 0): [0.1, 0.9],
+        },
+        [1.0, 0.0],
+        floor=0.2,
+    )
+    assert method == "embedding"
+    assert ranked[0][2].document_id == "HAR-LV-009"
+
+
+def test_agent_trace_lists_steps_without_hidden_documents():
+    corpus = build_corpus()
+    payload = AnswerService(PolicyEngine(corpus)).ask(user(corpus, "lan"), ANNUAL, ASK)
+    assert [step["tool"] for step in payload["steps"]] == [
+        "identity", "classify", "policy", "retrieve", "compose",
+    ]
+    blob = str(payload["steps"]) + str(payload["passages"])
+    assert "HAR-LV-009" not in blob
+    assert "APT-PAY-200" not in blob
+    assert any(item["document_id"] == "APT-LV-014" and item["used"] for item in payload["passages"])
 
 
 def test_chat_answers_from_permitted_documents_only(tmp_path):
@@ -371,10 +429,10 @@ def test_deleted_document_is_no_longer_used(tmp_path):
     path = tmp_path / "demo.sqlite"
     init_state(path)
     client = TestClient(app)
-    deleted = client.delete("/api/documents/APT-ENG-010-v1")
+    deleted = client.delete("/api/documents/APT-ENG-010-v1", params={"persona_id": "admin"})
     assert deleted.status_code == 200
-    assert client.get("/api/documents/APT-ENG-010-v1").status_code == 404
-    assert client.delete("/api/documents/APT-ENG-010-v1").status_code == 404
+    assert client.get("/api/documents/APT-ENG-010-v1", params={"persona_id": "nam"}).status_code == 404
+    assert client.delete("/api/documents/APT-ENG-010-v1", params={"persona_id": "admin"}).status_code == 404
 
     nam = client.post(
         "/api/ask",
@@ -480,3 +538,93 @@ def test_reject_duplicate_version_and_unknown_org(tmp_path):
     )
     assert duplicate.status_code == 409
     assert unknown.status_code == 400
+
+
+def test_overlapping_versions_follow_supersedes():
+    from dataclasses import replace
+
+    from app.models import Corpus
+
+    corpus = build_corpus()
+    old = document(corpus, "APT-LV-014", 2)
+    revised = replace(old, effective_to=None)
+    documents = tuple(
+        revised if item.version_id == old.version_id else item
+        for item in corpus.documents
+    )
+    edited = Corpus(orgs=corpus.orgs, users=corpus.users, documents=documents, exceptions=[])
+    decision = PolicyEngine(edited).resolve_effective(user(edited, "lan"), "leave.annual", ASK)
+    assert decision.outcome == "answered"
+    assert decision.winner.key == "APT-LV-014 v3"
+    rejected = {item.key: reason for item, reason in decision.visible_rejected}
+    assert rejected["APT-LV-014 v2"] == "superseded"
+
+
+def test_answer_context_keeps_only_the_governing_statement():
+    from app.retrieve import chunks_for_answer
+
+    corpus = build_corpus()
+    engine = PolicyEngine(corpus)
+    decision = engine.resolve_effective(user(corpus, "lan"), "leave.annual", ASK)
+    chunks = chunks_for_answer(
+        engine,
+        user(corpus, "lan"),
+        "Quy định nghỉ phép Công ty Har được 99 ngày đúng không?",
+        ASK,
+        decision,
+    )
+    assert "99 ngày" not in "\n".join(chunks)
+    assert "14 ngày" in chunks[0]
+
+
+def test_library_rejects_unreadable_and_anonymous_access(tmp_path):
+    from app.main import app, init_state
+
+    init_state(tmp_path / "demo.sqlite")
+    client = TestClient(app)
+    assert client.get("/api/documents").status_code == 422
+
+    denied = client.get("/api/documents/APT-PAY-200-v1", params={"persona_id": "lan"})
+    assert denied.status_code == 403
+    assert "80 triệu" not in denied.text
+    draft = client.get("/api/documents/APT-LV-014-v4", params={"persona_id": "lan"})
+    assert draft.status_code == 403
+    assert "16 ngày" not in draft.text
+    har = client.get("/api/documents/HAR-LV-009-v1", params={"persona_id": "lan"})
+    assert har.status_code == 403
+    assert "ca kíp" not in har.text
+
+    listed = {item["document_id"] for item in client.get("/api/documents", params={"persona_id": "lan"}).json()}
+    assert "APT-LV-014" in listed
+    assert "APT-PAY-200" not in listed
+    assert "HAR-LV-009" not in listed
+
+    blocked_delete = client.delete("/api/documents/APT-PAY-200-v1", params={"persona_id": "lan"})
+    assert blocked_delete.status_code == 403
+    assert client.get("/api/documents/APT-PAY-200-v1", params={"persona_id": "admin"}).status_code == 403
+
+    blocked_create = client.post(
+        "/api/documents",
+        json={**NEW_DOCUMENT, "document_id": "APT-LV-098", "persona_id": "lan"},
+    )
+    assert blocked_create.status_code == 403
+    assert "15 ngày" not in blocked_create.text
+
+
+def test_open_chat_skips_procedures_outside_the_asker(tmp_path):
+    from app.main import app, init_state
+
+    init_state(tmp_path / "demo.sqlite")
+    client = TestClient(app)
+    hoa = client.post(
+        "/api/chat",
+        json={
+            "persona_id": "hoa",
+            "question": "Nhóm Lương xử lý bảng vào ngày nào?",
+            "as_of": "2026-10-08",
+        },
+    ).json()
+    blob = hoa["answer"] + str(hoa["sources"])
+    assert "ngày 25" not in blob
+    assert "APT-PAY-010" not in blob
+

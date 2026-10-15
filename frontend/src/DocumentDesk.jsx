@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { post, remove, request } from "./api"
 
 const EMPTY = {
@@ -18,6 +18,7 @@ const EMPTY = {
   effective_from: "2026-01-01",
   effective_to: "",
   override_mode: "default",
+  supplementTarget: "",
   supersedes: "",
   content: "",
 }
@@ -55,7 +56,33 @@ const OVERRIDE_LABELS = {
   supplement: "Bổ sung",
 }
 
-export default function DocumentDesk({ catalog, documents, onSaved, focusId }) {
+function formFromDocument(document, topics) {
+  const knownTopic = topics.some((topic) => topic.id === document.topic)
+  return {
+    document_id: document.document_id,
+    version: document.version,
+    title: document.title,
+    topic: knownTopic ? document.topic : (topics[0]?.id || ""),
+    customTopic: knownTopic ? "" : document.topic,
+    phrases: (document.match_phrases || []).join(", "),
+    owner_org: document.owner_org,
+    audience_orgs: document.audience_orgs || [],
+    audience_type: document.audience_type,
+    classification: document.classification,
+    contracts: document.allowed_contract_types || [],
+    status: document.status,
+    required_role: document.required_role || "",
+    effective_from: document.effective_from || "",
+    effective_to: document.effective_to || "",
+    override_mode: document.override_mode,
+    supplementTarget: document.supplement_target || "",
+    supersedes: document.supersedes || "",
+    content: document.content,
+  }
+}
+
+export default function DocumentDesk({ catalog, documents, onSaved, focusId, personaId, asOf, canManage, personas, onPersonaChange }) {
+  const formCard = useRef(null)
   const [form, setForm] = useState(EMPTY)
   const [query, setQuery] = useState("")
   const [message, setMessage] = useState("")
@@ -74,7 +101,11 @@ export default function DocumentDesk({ catalog, documents, onSaved, focusId }) {
     setOpenError("")
     setConfirming(false)
     try {
-      setOpened(await request(`/api/documents/${encodeURIComponent(versionId)}`))
+      const params = new URLSearchParams({ persona_id: personaId, as_of: asOf })
+      const detail = await request(`/api/documents/${encodeURIComponent(versionId)}?${params}`)
+      setOpened(detail)
+      setForm(formFromDocument(detail, catalog.topics))
+      formCard.current?.scrollIntoView({ block: "start" })
     } catch (error) {
       setOpened(null)
       setOpenError(error.message)
@@ -88,9 +119,11 @@ export default function DocumentDesk({ catalog, documents, onSaved, focusId }) {
     setTone("")
     setMessage("Đang xóa...")
     try {
-      await remove(`/api/documents/${encodeURIComponent(opened.version_id)}`)
+      const params = new URLSearchParams({ persona_id: personaId })
+      await remove(`/api/documents/${encodeURIComponent(opened.version_id)}?${params}`)
       setOpened(null)
       setConfirming(false)
+      setForm(EMPTY)
       setTone("ok")
       setMessage(`Đã xóa ${label}.`)
       await onSaved()
@@ -131,6 +164,7 @@ export default function DocumentDesk({ catalog, documents, onSaved, focusId }) {
     setMessage("Đang lưu...")
     try {
       const saved = await post("/api/documents", {
+        persona_id: personaId,
         document_id: form.document_id,
         version: Number(form.version),
         title: form.title,
@@ -146,6 +180,7 @@ export default function DocumentDesk({ catalog, documents, onSaved, focusId }) {
         effective_from: form.effective_from,
         effective_to: form.effective_to || null,
         override_mode: form.override_mode,
+        supplement_target: form.supplementTarget || null,
         supersedes: form.supersedes ? Number(form.supersedes) : null,
         content: form.content,
       })
@@ -163,9 +198,20 @@ export default function DocumentDesk({ catalog, documents, onSaved, focusId }) {
 
   return (
     <div className="desk">
-      <form className="form-card" onSubmit={save}>
-        <div>
-          <h2>Thêm tài liệu</h2>
+      <form className="form-card" ref={formCard} onSubmit={save}>
+        <div className="library-head">
+          <h2>{opened ? opened.title : "Thêm tài liệu"}</h2>
+          <label>Người đang xem
+            <select value={personaId} onChange={(event) => onPersonaChange(event.target.value)}>
+              {personas.map((persona) => <option key={persona.id} value={persona.id}>{persona.name} · {persona.org}</option>)}
+            </select>
+          </label>
+        </div>
+        <div className="actions">
+          {opened ? null : <p className="lede">Thư viện chỉ hiện tài liệu người này được đọc.</p>}
+          {opened ? (
+            <button className="ghost" type="button" onClick={() => { setOpened(null); setConfirming(false); setForm(EMPTY) }}>Tạo mới</button>
+          ) : null}
         </div>
         <div className="grid">
           <label>Mã tài liệu
@@ -257,6 +303,9 @@ export default function DocumentDesk({ catalog, documents, onSaved, focusId }) {
               ))}
             </select>
           </label>
+          <label>Bổ sung cho mã tài liệu
+            <input value={form.supplementTarget} placeholder="APX-RW-001" onChange={(event) => update("supplementTarget", event.target.value)} />
+          </label>
           <label>Thay phiên bản số
             <input type="number" min="1" value={form.supersedes} onChange={(event) => update("supersedes", event.target.value)} />
           </label>
@@ -265,7 +314,7 @@ export default function DocumentDesk({ catalog, documents, onSaved, focusId }) {
           </label>
         </div>
         <div className="actions">
-          <button className="primary" type="submit" disabled={saving}>Lưu tài liệu</button>
+          <button className="primary" type="submit" disabled={saving || !canManage}>{canManage ? "Lưu tài liệu" : "Chỉ Admin được lưu"}</button>
         </div>
         {message ? <p className={`banner ${tone}`}>{message}</p> : null}
       </form>
@@ -274,48 +323,38 @@ export default function DocumentDesk({ catalog, documents, onSaved, focusId }) {
           <h2>Thư viện</h2>
           <p className="lede">{documents.length} phiên bản</p>
         </div>
+        <label>Lọc
+          <input value={query} placeholder="Mã, tên hoặc chủ đề" onChange={(event) => setQuery(event.target.value)} />
+        </label>
         {opened ? (
-          <article className="reader">
-            <div className="actions">
-              <button className="ghost" type="button" onClick={() => { setOpened(null); setConfirming(false) }}>Quay lại danh sách</button>
-              {confirming ? (
-                <>
-                  <button className="danger" type="button" disabled={removing} onClick={removeOpened}>
-                    {removing ? "Đang xóa..." : "Xóa hẳn"}
-                  </button>
-                  <button className="ghost" type="button" disabled={removing} onClick={() => setConfirming(false)}>Giữ lại</button>
-                </>
-              ) : (
-                <button className="danger" type="button" onClick={() => setConfirming(true)}>Xóa phiên bản này</button>
-              )}
-            </div>
-            <h2>{opened.title}</h2>
-            <p className="mono">{opened.document_id} v{opened.version}</p>
-            <p className="lede">
-              {STATUS_LABELS[opened.status] || opened.status}
-              {" · "}{opened.owner_name}
-              {" · "}từ {opened.effective_from}
-              {opened.effective_to ? ` đến ${opened.effective_to}` : ""}
-            </p>
-            <p className="reading">{opened.content}</p>
-          </article>
-        ) : (
-          <>
-            <label>Lọc
-              <input value={query} placeholder="Mã, tên hoặc chủ đề" onChange={(event) => setQuery(event.target.value)} />
-            </label>
-            {openError ? <p className="banner error">{openError}</p> : null}
-            <div>
-              {visible.map((item) => (
-                <button className="doc-row" type="button" key={item.version_id} onClick={() => openVersion(item.version_id)}>
-                  <strong className="mono">{item.document_id} v{item.version}</strong>
-                  <span>{item.title}</span>
-                  <span className={`status ${item.status}`}>{STATUS_LABELS[item.status] || item.status}</span>
+          <div className="actions">
+            {confirming ? (
+              <>
+                <button className="danger" type="button" disabled={removing} onClick={removeOpened}>
+                  {removing ? "Đang xóa..." : "Xóa hẳn"}
                 </button>
-              ))}
-            </div>
-          </>
-        )}
+                <button className="ghost" type="button" disabled={removing} onClick={() => setConfirming(false)}>Giữ lại</button>
+              </>
+            ) : canManage ? (
+              <button className="danger" type="button" onClick={() => setConfirming(true)}>Xóa phiên bản này</button>
+            ) : null}
+          </div>
+        ) : null}
+        {openError ? <p className="banner error">{openError}</p> : null}
+        <div>
+          {visible.map((item) => (
+            <button
+              className={opened?.version_id === item.version_id ? "doc-row active" : "doc-row"}
+              type="button"
+              key={item.version_id}
+              onClick={() => openVersion(item.version_id)}
+            >
+              <strong className="mono">{item.document_id} v{item.version}</strong>
+              <span>{item.title}</span>
+              <span className={`status ${item.status}`}>{STATUS_LABELS[item.status] || item.status}</span>
+            </button>
+          ))}
+        </div>
       </aside>
     </div>
   )

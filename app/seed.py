@@ -331,6 +331,8 @@ Quy định áp dụng trong Công ty Har.
             required_role="manager",
             status="published",
             effective_from="2026-01-01",
+            override_mode="supplement",
+            supplement_target="APX-RW-001",
             published_at="2026-01-01",
             content="""
 Quản lý được phê duyệt thêm một ngày làm việc từ xa đột xuất trong tháng.
@@ -427,6 +429,60 @@ Tài liệu này dành cho quản lý Phòng Nhân sự.
 Thưởng cuối năm của Công ty Har là một tháng lương.
 
 Chưa có quan hệ thay thế với bản B.
+""",
+        ),
+        _add(
+            document_id="APT-REC-001",
+            version=1,
+            title="Quy trình tiếp nhận hồ sơ của Nhóm Tuyển dụng",
+            topic="recruit.intake",
+            doc_type="quy_trinh",
+            owner_org="apx/apt/hr/recruit",
+            audience_orgs=["apx/apt/hr/recruit"],
+            audience_type="exact",
+            status="published",
+            effective_from="2026-01-01",
+            published_at="2026-01-01",
+            content="""
+Nhóm Tuyển dụng tiếp nhận hồ sơ ứng viên trong vòng 5 ngày làm việc.
+
+Quy trình này chỉ dùng cho Nhóm Tuyển dụng.
+""",
+        ),
+        _add(
+            document_id="HAR-HR-001",
+            version=1,
+            title="Quy trình tiếp nhận nhân sự mới của Phòng Nhân sự Har",
+            topic="hr.onboarding",
+            doc_type="quy_trinh",
+            owner_org="apx/har/hr",
+            audience_orgs=["apx/har/hr"],
+            audience_type="exact",
+            status="published",
+            effective_from="2026-01-01",
+            published_at="2026-01-01",
+            content="""
+Phòng Nhân sự Har hoàn tất hồ sơ nhân sự mới trong 3 ngày làm việc kể từ ngày nhận việc.
+
+Quy trình này chỉ dùng cho Phòng Nhân sự Har.
+""",
+        ),
+        _add(
+            document_id="HAR-OPS-001",
+            version=1,
+            title="Quy định phân ca của Phòng Vận hành",
+            topic="work.shift",
+            doc_type="quy_dinh",
+            owner_org="apx/har/ops",
+            audience_orgs=["apx/har/ops"],
+            audience_type="exact",
+            status="published",
+            effective_from="2026-01-01",
+            published_at="2026-01-01",
+            content="""
+Phòng Vận hành sắp ca làm việc trước 3 ngày và không đổi ca trong ngày nghỉ lễ.
+
+Quy định này chỉ dùng cho Phòng Vận hành.
 """,
         ),
         _add(

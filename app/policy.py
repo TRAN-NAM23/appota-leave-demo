@@ -127,10 +127,29 @@ class PolicyEngine:
         if not candidates:
             return decision
 
-        floors = [document for document in candidates if document.override_mode == "mandatory"]
+        candidates = self._drop_superseded(decision, candidates)
+        supplements = [document for document in candidates if document.override_mode == "supplement"]
+        primary = [document for document in candidates if document.override_mode != "supplement"]
+        if not primary:
+            for document in supplements:
+                decision.visible_rejected.append((document, "unmatched_supplement"))
+            return decision
+
+        floors = [document for document in primary if document.override_mode == "mandatory"]
         if floors:
-            return self._resolve_mandatory(decision, floors, candidates)
-        return self._resolve_deepest(decision, user, candidates)
+            decision = self._resolve_mandatory(decision, floors, primary)
+        else:
+            decision = self._resolve_deepest(decision, user, primary)
+        if decision.outcome == "answered" and decision.winner is not None:
+            attached = {document.version_id for document in decision.supplements}
+            for document in supplements:
+                if document.version_id in attached:
+                    continue
+                if document.supplement_target == decision.winner.document_id:
+                    decision.supplements.append(document)
+                else:
+                    decision.visible_rejected.append((document, "unmatched_supplement"))
+        return decision
 
     def _audience_visible(self, user: User, document: Document) -> bool:
         if audience_covers_org(document, user.org):
@@ -142,10 +161,35 @@ class PolicyEngine:
         )
 
     def _admin_covers_owner(self, user: User, document: Document) -> bool:
-        return any(
-            role.role == "policy_admin" and scope_covers(role.scope, document.owner_org)
+        return self.can_publish(user, document.owner_org, document.classification)
+
+    def can_publish(self, user: User, owner_org: str, classification: str) -> bool:
+        covered = any(
+            role.role == "policy_admin" and scope_covers(role.scope, owner_org)
             for role in user.roles
         )
+        if not covered:
+            return False
+        return CLEARANCE_RANK[user.clearance] >= CLEARANCE_RANK[classification]
+
+    def _drop_superseded(self, decision: Decision, candidates: list[Document]) -> list[Document]:
+        by_document: dict[str, list[Document]] = {}
+        for document in candidates:
+            by_document.setdefault(document.document_id, []).append(document)
+        removed: set[str] = set()
+        for document in candidates:
+            if document.supersedes is None:
+                continue
+            for previous in by_document.get(document.document_id, []):
+                if previous.version == document.supersedes:
+                    removed.add(previous.version_id)
+        kept: list[Document] = []
+        for document in candidates:
+            if document.version_id in removed:
+                decision.visible_rejected.append((document, "superseded"))
+            else:
+                kept.append(document)
+        return kept
 
     def _resolve_mandatory(
         self,

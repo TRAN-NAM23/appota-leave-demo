@@ -44,6 +44,7 @@ export default function ChatDesk({ personas, onOpen }) {
   return (
     <main className="shell">
       <form className="panel" onSubmit={submit}>
+        <p className="lede">Agent gắn đúng người hỏi, lọc quyền, lấy đoạn tài liệu liên quan, rồi mới viết câu trả lời.</p>
         <label>Người hỏi
           <select value={personaId} onChange={(event) => { setPersonaId(event.target.value); setTurns([]) }}>
             {personas.map((persona) => <option key={persona.id} value={persona.id}>{personaLabel(persona)}</option>)}
@@ -76,7 +77,7 @@ export default function ChatDesk({ personas, onOpen }) {
                       className="text-link"
                       type="button"
                       key={`${source.document_id}-${source.version}`}
-                      onClick={() => onOpen(`${source.document_id}-v${source.version}`)}
+                      onClick={() => onOpen(`${source.document_id}-v${source.version}`, turn.persona.id)}
                     >
                       {source.document_id} v{source.version}
                     </button>

@@ -13,7 +13,7 @@ const STATUS_LABELS = {
   archived: "Lưu trữ",
 }
 
-function OrgNode({ node, onOpen, onDelete }) {
+function OrgNode({ node, onOpen, onDelete, canManage }) {
   const [open, setOpen] = useState(false)
   const [pendingId, setPendingId] = useState(null)
   const [removingId, setRemovingId] = useState(null)
@@ -72,7 +72,7 @@ function OrgNode({ node, onOpen, onDelete }) {
                 </button>
                 <div className="chart-doc-meta">
                   <span className={`status ${document.status}`}>{STATUS_LABELS[document.status] || document.status}</span>
-                {pendingId === document.version_id ? (
+                {canManage && pendingId === document.version_id ? (
                   <button
                     className="doc-delete"
                     type="button"
@@ -81,9 +81,9 @@ function OrgNode({ node, onOpen, onDelete }) {
                   >
                     {removingId === document.version_id ? "..." : "Xóa hẳn"}
                   </button>
-                ) : (
+                ) : canManage ? (
                   <button className="doc-delete" type="button" onClick={() => setPendingId(document.version_id)}>Xóa</button>
-                )}
+                ) : null}
                 </div>
               </div>
             ))}
@@ -93,7 +93,7 @@ function OrgNode({ node, onOpen, onDelete }) {
       </article>
       {node.children.length ? (
         <ul>
-          {node.children.map((child) => <OrgNode key={child.id} node={child} onOpen={onOpen} onDelete={onDelete} />)}
+          {node.children.map((child) => <OrgNode key={child.id} node={child} onOpen={onOpen} onDelete={onDelete} canManage={canManage} />)}
         </ul>
       ) : null}
     </li>
@@ -143,11 +143,16 @@ function FittedChart({ children }) {
   )
 }
 
-export default function OrgTree({ tree, onOpen, onDelete }) {
+export default function OrgTree({ tree, onOpen, onDelete, canManage, personas, personaId, onPersonaChange }) {
   return (
     <div className="org-page">
-      <div>
+      <div className="library-head">
         <h2>Cây tổ chức</h2>
+        <label>Người đang xem
+          <select value={personaId} onChange={(event) => onPersonaChange(event.target.value)}>
+            {personas.map((persona) => <option key={persona.id} value={persona.id}>{persona.name} · {persona.org}</option>)}
+          </select>
+        </label>
       </div>
       <div className="level-row">
         {tree.levels.map((level) => (
@@ -161,7 +166,7 @@ export default function OrgTree({ tree, onOpen, onDelete }) {
       <section className="tree">
         <FittedChart>
           <ul>
-            {tree.tree.map((node) => <OrgNode key={node.id} node={node} onOpen={onOpen} onDelete={onDelete} />)}
+            {tree.tree.map((node) => <OrgNode key={node.id} node={node} onOpen={onOpen} onDelete={onDelete} canManage={canManage} />)}
           </ul>
         </FittedChart>
       </section>

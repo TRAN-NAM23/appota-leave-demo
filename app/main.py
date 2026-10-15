@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
+from starlette.types import Scope
 from pydantic import BaseModel, Field
 
 from app.answer import AnswerService
@@ -20,10 +21,12 @@ from app.catalog import (
     save_document,
 )
 from app.db import delete_document, ensure_database, load_corpus
+from app.models import CLEARANCE_RANK, Document, User
 from app.policy import PolicyEngine
 
 
 DIST = Path(__file__).resolve().parent.parent / "web" / "dist"
+DEMO_AS_OF = date(2026, 10, 8)
 ENGINE: PolicyEngine | None = None
 SERVICE: AnswerService | None = None
 
@@ -46,6 +49,28 @@ def reload_state(path: Path) -> AnswerService:
     ENGINE = PolicyEngine(load_corpus(path))
     SERVICE = AnswerService(ENGINE, db_path=path)
     return SERVICE
+
+
+def require_user(service: AnswerService, persona_id: str) -> User:
+    user = service.engine.corpus.users.get(persona_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="Không có người dùng này trong dữ liệu giả lập.")
+    return user
+
+
+def readable_ids(service: AnswerService, user: User, on: date) -> set[str]:
+    return {
+        document.version_id
+        for document in service.engine.corpus.documents
+        if service.engine.can_read(user, document, "read", on).allowed
+    }
+
+
+def find_version(service: AnswerService, version_id: str) -> Document | None:
+    return next(
+        (document for document in service.engine.corpus.documents if document.version_id == version_id),
+        None,
+    )
 
 
 def get_service() -> AnswerService:
@@ -77,6 +102,7 @@ class CompareRequest(BaseModel):
 
 
 class DocumentRequest(BaseModel):
+    persona_id: str
     document_id: str = Field(min_length=1)
     version: int = Field(ge=1)
     title: str = Field(min_length=3)
@@ -130,20 +156,28 @@ def catalog() -> dict:
 
 
 @app.get("/api/org-tree")
-def organization_tree() -> dict:
+def organization_tree(persona_id: str, as_of: date = DEMO_AS_OF) -> dict:
     service = get_service()
-    return org_tree(service.engine.corpus)
+    user = require_user(service, persona_id)
+    return org_tree(service.engine.corpus, readable_ids(service, user, as_of))
 
 
 @app.get("/api/documents")
-def documents() -> list[dict]:
+def documents(persona_id: str, as_of: date = DEMO_AS_OF) -> list[dict]:
     service = get_service()
-    return document_summaries(service.engine.corpus)
+    user = require_user(service, persona_id)
+    return document_summaries(service.engine.corpus, readable_ids(service, user, as_of))
 
 
 @app.get("/api/documents/{version_id}")
-def document(version_id: str) -> dict:
+def document(version_id: str, persona_id: str, as_of: date = DEMO_AS_OF) -> dict:
     service = get_service()
+    user = require_user(service, persona_id)
+    found = find_version(service, version_id)
+    if found is None:
+        raise HTTPException(status_code=404, detail="Không có phiên bản tài liệu này.")
+    if not service.engine.can_read(user, found, "read", as_of).allowed:
+        raise HTTPException(status_code=403, detail="Bạn không được xem tài liệu này.")
     detail = document_detail(service.engine.corpus, version_id)
     if detail is None:
         raise HTTPException(status_code=404, detail="Không có phiên bản tài liệu này.")
@@ -151,8 +185,14 @@ def document(version_id: str) -> dict:
 
 
 @app.delete("/api/documents/{version_id}")
-def remove_document(version_id: str) -> dict:
+def remove_document(version_id: str, persona_id: str) -> dict:
     service = get_service()
+    user = require_user(service, persona_id)
+    found = find_version(service, version_id)
+    if found is None:
+        raise HTTPException(status_code=404, detail="Không có phiên bản tài liệu này.")
+    if not service.engine.can_publish(user, found.owner_org, found.classification):
+        raise HTTPException(status_code=403, detail="Bạn không được xóa tài liệu này.")
     path = service.db_path or default_db_path()
     if not delete_document(path, version_id):
         raise HTTPException(status_code=404, detail="Không có phiên bản tài liệu này.")
@@ -163,9 +203,21 @@ def remove_document(version_id: str) -> dict:
 @app.post("/api/documents", status_code=201)
 def create_document(request: DocumentRequest) -> dict:
     service = get_service()
+    user = require_user(service, request.persona_id)
+    if (
+        request.owner_org in service.engine.corpus.orgs
+        and request.classification in CLEARANCE_RANK
+        and not service.engine.can_publish(user, request.owner_org, request.classification)
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Chỉ quản trị chính sách của đơn vị ban hành mới được thêm tài liệu.",
+        )
     path = service.db_path or default_db_path()
+    payload = request.model_dump()
+    payload.pop("persona_id", None)
     try:
-        document = save_document(path, service.engine.corpus, request.model_dump())
+        document = save_document(path, service.engine.corpus, payload)
     except CatalogError as error:
         raise HTTPException(status_code=error.status, detail=str(error)) from error
     reload_state(path)
@@ -191,5 +243,13 @@ def compare(request: CompareRequest) -> dict:
     }
 
 
+class AppFiles(StaticFiles):
+    async def get_response(self, path: str, scope: Scope):
+        response = await super().get_response(path, scope)
+        if path in {"", "index.html"} or path.endswith(".html"):
+            response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 if DIST.is_dir():
-    app.mount("/", StaticFiles(directory=DIST, html=True), name="frontend")
+    app.mount("/", AppFiles(directory=DIST, html=True), name="frontend")
