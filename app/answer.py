@@ -33,7 +33,7 @@ TOPIC_RULES = (
     (("ốm",), "leave.sick"),
     (("tối thiểu", "theo luật"), "leave.minimum"),
     (("thưởng",), "pay.bonus"),
-    (("lương chi tiết", "bảng lương chi tiết"), "pay.restricted"),
+    (("lương chi tiết", "bảng lương chi tiết", "giám đốc"), "pay.restricted"),
     (("phụ cấp",), "pay.benefit"),
     (("chốt bảng lương", "tính lương"), "pay.process"),
     (("trả lương", "lịch lương", "ngày lương"), "pay.schedule"),

@@ -11,9 +11,16 @@ const CONTRACTS = {
   contractor: "cộng tác viên",
 }
 
+const CLEARANCE = {
+  internal: "nội bộ",
+  confidential: "mật",
+  restricted: "hạn chế",
+}
+
 function personaLabel(persona) {
   const contract = CONTRACTS[persona.employment_type] || persona.employment_type
-  return `${persona.name} · ${persona.org_path} · ${contract}`
+  const clearance = CLEARANCE[persona.clearance] || persona.clearance
+  return `${persona.name} · ${persona.org_path} · ${contract} · ${clearance}`
 }
 
 export default function App() {

@@ -203,7 +203,7 @@ export default function DocumentDesk({ catalog, documents, onSaved, focusId, per
           <h2>{opened ? opened.title : "Thêm tài liệu"}</h2>
           <label>Người đang xem
             <select value={personaId} onChange={(event) => onPersonaChange(event.target.value)}>
-              {personas.map((persona) => <option key={persona.id} value={persona.id}>{persona.name} · {persona.org}</option>)}
+              {personas.map((persona) => <option key={persona.id} value={persona.id}>{persona.name} · {persona.org} · {persona.clearance === "restricted" ? "hạn chế" : persona.clearance === "confidential" ? "mật" : "nội bộ"}</option>)}
             </select>
           </label>
         </div>

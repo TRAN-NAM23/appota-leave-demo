@@ -150,7 +150,7 @@ export default function OrgTree({ tree, onOpen, onDelete, canManage, personas, p
         <h2>Cây tổ chức</h2>
         <label>Người đang xem
           <select value={personaId} onChange={(event) => onPersonaChange(event.target.value)}>
-            {personas.map((persona) => <option key={persona.id} value={persona.id}>{persona.name} · {persona.org}</option>)}
+            {personas.map((persona) => <option key={persona.id} value={persona.id}>{persona.name} · {persona.org} · {persona.clearance === "restricted" ? "hạn chế" : persona.clearance === "confidential" ? "mật" : "nội bộ"}</option>)}
           </select>
         </label>
       </div>

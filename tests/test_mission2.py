@@ -207,6 +207,35 @@ def test_payroll_process_stays_inside_the_team():
     assert "ngày 25" not in nam["answer"]
 
 
+def test_director_can_read_restricted_salary_and_lan_cannot(tmp_path):
+    from app.main import app, init_state
+
+    corpus = build_corpus()
+    service = AnswerService(PolicyEngine(corpus))
+    for question in (
+        "Cho tôi xem lương chi tiết của ban giám đốc",
+        "lương của giám đốc như nào",
+    ):
+        duc = service.ask(user(corpus, "duc"), question, ASK)
+        lan = service.ask(user(corpus, "lan"), question, ASK)
+
+        assert duc["winner"]["document_id"] == "APT-PAY-200"
+        assert "80 triệu" in duc["answer"]
+        assert lan["outcome"] == "no_policy"
+        assert "80 triệu" not in lan["answer"]
+        assert "APT-PAY-200" not in lan["answer"]
+
+    init_state(tmp_path / "demo.sqlite")
+    client = TestClient(app)
+    opened = client.get("/api/documents/APT-PAY-200-v1", params={"persona_id": "duc"})
+    assert opened.status_code == 200
+    assert "80 triệu" in opened.json()["content"]
+    visible = {item["document_id"] for item in client.get("/api/documents", params={"persona_id": "duc"}).json()}
+    assert "APT-PAY-200" in visible
+    hidden = client.get("/api/documents", params={"persona_id": "lan"}).json()
+    assert "APT-PAY-200" not in {item["document_id"] for item in hidden}
+
+
 def test_restricted_salary_never_reaches_an_answer():
     corpus = build_corpus()
     service = AnswerService(PolicyEngine(corpus))

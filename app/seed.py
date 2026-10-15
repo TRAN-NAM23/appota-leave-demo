@@ -120,6 +120,14 @@ def build_corpus() -> Corpus:
             "internal",
             (RoleAssignment("contractor", "apx/har/ops"),),
         ),
+        "duc": User(
+            "duc",
+            "Đức",
+            "apx/apt",
+            "full_time",
+            "restricted",
+            (RoleAssignment("employee", "apx/apt"),),
+        ),
     }
     documents = [
         _add(

@@ -166,6 +166,39 @@ def ensure_database(path: Path) -> None:
         connection.close()
     if count == 0:
         seed_database(path)
+        return
+    ensure_seed_users(path)
+
+
+def ensure_seed_users(path: Path) -> None:
+    corpus = build_corpus()
+    connection = connect(path)
+    try:
+        existing = {row["id"] for row in connection.execute("SELECT id FROM users")}
+        missing = [user for user in corpus.users.values() if user.id not in existing]
+        if not missing:
+            return
+        connection.executemany(
+            """
+            INSERT INTO users (id, name, org_id, employment_type, clearance)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                (user.id, user.name, user.org, user.employment_type, user.clearance)
+                for user in missing
+            ],
+        )
+        connection.executemany(
+            "INSERT INTO role_assignments (user_id, role, scope) VALUES (?, ?, ?)",
+            [
+                (user.id, role.role, role.scope)
+                for user in missing
+                for role in user.roles
+            ],
+        )
+        connection.commit()
+    finally:
+        connection.close()
 
 
 def insert_document(path: Path, document: Document) -> None:

@@ -49,8 +49,8 @@ Cùng câu nghỉ phép, Lan hỏi ở hai ngày.
 
 Câu hỏi: "Cho tôi xem lương chi tiết của ban giám đốc." Kèm mở tài liệu `APT-PAY-200`.
 
-- Kỳ vọng: không persona nào trong seed có clearance `restricted`, nên câu trả lời và API tài liệu đều không chứa nội dung đó.
-- Kết quả: ask trả `no_policy` và không có "80 triệu". `GET /api/documents/APT-PAY-200-v1?persona_id=lan` trả 403, body không có nội dung. Lan không xóa được tài liệu này. Gọi API không có `persona_id` trả 422.
+- Kỳ vọng: chỉ người có mức hạn chế mới xem được `APT-PAY-200`. Lan không thấy nội dung.
+- Kết quả: Đức, Giám đốc Công ty Appota, mức hạn chế, nhận `APT-PAY-200` và "80 triệu". Lan nhận `no_policy`, không có "80 triệu". `GET /api/documents/APT-PAY-200-v1?persona_id=lan` trả 403. Gọi API không có `persona_id` trả 422.
 - Đạt trên luồng đã khóa. Case này từng hỏng khi API tài liệu trả nguyên văn mà không xét persona.
 - Điều học được: lọc ở API hỏi đáp là chưa đủ nếu thư viện tài liệu là một cửa khác.
 
