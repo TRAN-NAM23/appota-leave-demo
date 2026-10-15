@@ -47,15 +47,10 @@ h1, h2, p { margin: 0; }
 
 .brand { display: flex; gap: 14px; align-items: center; }
 
-.mark {
-  width: 42px;
-  height: 42px;
-  display: grid;
-  place-items: center;
-  border-radius: 12px;
-  background: var(--accent);
-  color: white;
-  font-weight: 700;
+.logo {
+  height: 56px;
+  width: auto;
+  display: block;
 }
 
 .eyebrow {

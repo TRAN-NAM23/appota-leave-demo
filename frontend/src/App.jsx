@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react"
+import logo from "./assets/logo.png"
 import AnswerCard from "./AnswerCard"
 import ChatDesk from "./ChatDesk"
 import DocumentDesk from "./DocumentDesk"
@@ -124,7 +125,7 @@ export default function App() {
     <div className="app">
       <header className="topbar">
         <div className="brand">
-          <div className="mark">A</div>
+          <img className="logo" src={logo} alt="Appota" />
           <div>
             <p className="eyebrow">Tri thức có phân quyền</p>
             <h1>Appota_leave-demo</h1>
