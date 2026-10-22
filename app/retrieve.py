@@ -61,6 +61,8 @@ def rank_statements(
             method = "keyword"
         scored.append((score, method, document))
     if query_vector is not None and not any(method == "embedding" for _score, method, _document in scored):
+        if floor > 0:
+            return "embedding", []
         return rank_statements(documents, question, {}, None, limit, 0.0)
     scored.sort(key=lambda item: item[0], reverse=True)
     method = scored[0][1] if scored else ("embedding" if query_vector is not None else "keyword")

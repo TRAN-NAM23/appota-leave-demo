@@ -3,7 +3,7 @@ from datetime import date
 
 from fastapi.testclient import TestClient
 
-from app.answer import AnswerService, citations_ok
+from app.answer import AnswerService
 from app.db import ensure_database, load_corpus, seed_database
 from app.models import AclException
 from app.policy import PolicyEngine
@@ -105,6 +105,57 @@ def test_lan_and_minh_receive_different_leave_answers():
     assert "ca kíp" in minh["answer"]
     assert "APT-LV-014" not in minh["answer"]
     assert "99 ngày" not in lan["answer"]
+
+
+def test_version_timeline_follows_the_ask_date():
+    corpus = build_corpus()
+    service = AnswerService(PolicyEngine(corpus))
+    before = service.ask(user(corpus, "lan"), ANNUAL, date(2026, 2, 28))
+    after = service.ask(user(corpus, "lan"), ANNUAL, date(2026, 3, 1))
+
+    assert before["winner"]["version"] == 2
+    assert before["winner"]["effective_to"] == "2026-02-28"
+    before_versions = {item["version"]: item for item in before["versions"]}
+    assert [item["version"] for item in before["versions"]] == [2, 3, 4]
+    assert before_versions[2]["mark"] == "current"
+    assert before_versions[3]["reason"] == "Chưa tới ngày hiệu lực"
+    assert before_versions[4]["readable"] is False
+    assert "title" not in before_versions[4]
+
+    assert after["winner"]["version"] == 3
+    assert after["winner"]["effective_from"] == "2026-03-01"
+    assert after["winner"]["owner"] == "Phòng Nhân sự"
+    after_versions = {item["version"]: item for item in after["versions"]}
+    assert after_versions[3]["mark"] == "current"
+    assert after_versions[2]["reason"] == "Hết hiệu lực"
+    assert after_versions[2]["effective_to"] == "2026-02-28"
+    assert after_versions[4]["status"] == "draft"
+    assert "16 ngày" not in str(after["versions"])
+    assert "99 ngày" not in str(after["versions"])
+
+
+def test_compare_can_use_two_ask_dates(tmp_path):
+    from app.main import app, init_state
+
+    init_state(tmp_path / "demo.sqlite")
+    client = TestClient(app)
+    response = client.post(
+        "/api/compare",
+        json={
+            "left_id": "lan",
+            "right_id": "lan",
+            "question": ANNUAL,
+            "as_of": "2026-10-08",
+            "left_as_of": "2026-02-28",
+            "right_as_of": "2026-03-01",
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["left"]["as_of"] == "2026-02-28"
+    assert payload["left"]["winner"]["version"] == 2
+    assert payload["right"]["as_of"] == "2026-03-01"
+    assert payload["right"]["winner"]["version"] == 3
 
 
 def test_version_follows_the_ask_date():
@@ -247,6 +298,53 @@ def test_restricted_salary_never_reaches_an_answer():
         assert "APT-PAY-200" not in answer["answer"]
 
 
+def test_refusal_names_the_context_gap_without_hidden_content():
+    corpus = build_corpus()
+    service = AnswerService(PolicyEngine(corpus))
+    salary = "Cho tôi xem lương chi tiết của ban giám đốc."
+    lan = service.ask(user(corpus, "lan"), salary, ASK)
+    hidden_blob = " ".join([
+        lan["answer"],
+        lan["reason"],
+        str(lan["steps"]),
+        str(lan["passages"]),
+        str(lan["visible_rejected"]),
+        str(lan["versions"]),
+    ])
+    assert "mức tiếp cận" in lan["reason"]
+    assert "nội bộ" in lan["reason"]
+    assert lan["persona"]["clearance"] == "internal"
+    assert lan["persona"]["roles"] == ["employee"]
+    assert lan["visible_rejected"] == []
+    assert "80 triệu" not in hidden_blob
+    assert "APT-PAY-200" not in hidden_blob
+
+    duc = service.ask(user(corpus, "duc"), salary, ASK)
+    assert duc["winner"]["document_id"] == "APT-PAY-200"
+    assert duc["persona"]["clearance"] == "restricted"
+
+    khoa = service.ask(user(corpus, "khoa"), ANNUAL, ASK)
+    khoa_text = khoa["answer"] + khoa["reason"]
+    assert "cộng tác viên" in khoa["reason"]
+    assert khoa["persona"]["employment_type"] == "contractor"
+    assert "12 ngày" not in khoa_text
+    assert "14 ngày" not in khoa_text
+    assert "APT-LV-014" not in khoa_text
+
+    admin = service.ask(user(corpus, "admin"), "Phụ cấp trách nhiệm của tôi là gì?", ASK)
+    assert "quản trị chính sách" in admin["reason"]
+    assert "5 triệu" not in admin["answer"] + admin["reason"]
+    assert "APT-PAY-030" not in admin["reason"]
+
+    nam = service.ask(user(corpus, "nam"), "Khi nào thì chốt bảng lương?", ASK)
+    assert "đơn vị" in nam["reason"]
+    assert "ngày 25" not in nam["answer"] + nam["reason"]
+    assert "APT-PAY-010" not in nam["reason"]
+
+    sick = service.ask(user(corpus, "lan"), "Quy định nghỉ ốm của tôi thế nào?", ASK)
+    assert sick["reason"] == "Không có tài liệu cho chủ đề này."
+
+
 def test_question_cannot_change_identity():
     corpus = build_corpus()
     answer = AnswerService(PolicyEngine(corpus)).ask(
@@ -256,6 +354,50 @@ def test_question_cannot_change_identity():
     )
     assert "80 triệu" not in answer["answer"]
     assert "16 ngày" not in answer["answer"]
+
+
+def test_decision_stack_keeps_level_and_override_mode():
+    corpus = build_corpus()
+    service = AnswerService(PolicyEngine(corpus))
+    remote = "Quy định làm việc từ xa của tôi như thế nào?"
+    nam = service.ask(user(corpus, "nam"), remote, ASK)
+    assert [(item["place"], item["document_id"], item["level_label"]) for item in nam["stack"]] == [
+        ("replaced", "APX-RW-001", "Tập đoàn"),
+        ("current", "APT-ENG-010", "Phòng"),
+    ]
+    assert nam["stack"][1]["audience_name"] == "Phòng Kỹ thuật"
+    assert nam["stack"][1]["override_mode"] == "default"
+    assert "3 ngày" in nam["stack"][1]["statement"]
+
+    floor = service.ask(user(corpus, "lan"), "Mức nghỉ phép tối thiểu theo luật là gì?", ASK)
+    assert [(item["place"], item["document_id"], item["label"]) for item in floor["stack"]] == [
+        ("current", "APX-LV-050", "Mức bắt buộc"),
+        ("supplement", "APT-LV-051", "Chỉ được bổ sung, không thay mức sàn"),
+    ]
+    assert floor["stack"][0]["level_label"] == "Tập đoàn"
+    assert floor["stack"][1]["level_label"] == "Công ty"
+    assert floor["stack"][0]["override_mode"] == "mandatory"
+
+    hoa = service.ask(user(corpus, "hoa"), remote, ASK)
+    supplement = hoa["stack"][-1]
+    assert supplement["document_id"] == "APT-RW-020"
+    assert supplement["place"] == "supplement"
+    assert supplement["label"] == "Bổ sung thêm điều khoản"
+    assert "bắt buộc" not in supplement["label"]
+
+    minh = service.ask(user(corpus, "minh"), "Thưởng cuối năm của tôi là bao nhiêu?", ASK)
+    assert minh["outcome"] == "conflict"
+    assert minh["winner"] is None
+    assert [(item["place"], item["document_id"], item["level_label"]) for item in minh["stack"]] == [
+        ("conflict", "HAR-BN-021", "Công ty"),
+        ("conflict", "HAR-BN-022", "Công ty"),
+    ]
+    assert "một tháng lương" in minh["stack"][0]["statement"]
+    assert "một tháng rưỡi" in minh["stack"][1]["statement"]
+
+    lan = service.ask(user(corpus, "lan"), "Thưởng cuối năm của tôi là bao nhiêu?", ASK)
+    assert lan["stack"] == []
+    assert "một tháng rưỡi" not in lan["answer"]
 
 
 def test_same_level_bonus_policies_conflict():
@@ -366,7 +508,8 @@ def test_compare_api_uses_the_policy_engine(tmp_path):
     assert payload["left"]["winner"]["document_id"] == "APT-LV-014"
     assert payload["right"]["winner"]["document_id"] == "HAR-LV-009"
     assert payload["left"]["llm_used"] is False
-    assert citations_ok(payload["left"]["answer"], {"APT-LV-014", "APX-LV-001"})
+    assert "14 ngày" in payload["left"]["answer"]
+    assert "APT-LV-014" not in payload["left"]["answer"]
     detail = client.get("/api/documents/APT-LV-014-v3", params={"persona_id": "lan"})
     assert detail.status_code == 200
     assert "14 ngày" in detail.json()["content"]
@@ -411,6 +554,22 @@ def test_embedding_rank_prefers_the_closer_statement():
     assert ranked[0][2].document_id == "HAR-LV-009"
 
 
+def test_rank_statements_refuses_instead_of_keyword_fallback_below_the_floor():
+    from app.retrieve import rank_statements
+
+    corpus = build_corpus()
+    har = document(corpus, "HAR-LV-009", 1)
+    method, ranked = rank_statements(
+        [har],
+        "Ca kíp được nghỉ thêm thế nào?",
+        {(har.version_id, 0): [1.0, 0.0]},
+        [0.0, 1.0],
+        floor=0.28,
+    )
+    assert method == "embedding"
+    assert ranked == []
+
+
 def test_agent_trace_lists_steps_without_hidden_documents():
     corpus = build_corpus()
     payload = AnswerService(PolicyEngine(corpus)).ask(user(corpus, "lan"), ANNUAL, ASK)
@@ -421,6 +580,94 @@ def test_agent_trace_lists_steps_without_hidden_documents():
     assert "HAR-LV-009" not in blob
     assert "APT-PAY-200" not in blob
     assert any(item["document_id"] == "APT-LV-014" and item["used"] for item in payload["passages"])
+    governing = "Nhân viên chính thức Công ty Appota được 14 ngày nghỉ phép năm."
+    assert payload["winner"]["statement"] == governing
+    used = next(item for item in payload["passages"] if item["used"] and item["document_id"] == "APT-LV-014")
+    assert used["statement"] == governing
+    assert "99 ngày" not in str(payload["passages"])
+    assert "99 ngày" not in str(payload["steps"])
+
+
+def test_agent_drops_a_passage_that_does_not_answer_the_question(tmp_path, monkeypatch):
+    from app.main import app, init_state
+
+    def judge(question, context):
+        del context
+        if "đơn" in question.casefold():
+            return {"answers": False, "reply": "Tài liệu không nói cách làm đơn xin nghỉ phép."}
+        return None
+
+    monkeypatch.setattr("app.answer.understand", judge)
+    init_state(tmp_path / "demo.sqlite")
+    client = TestClient(app)
+    form = client.post(
+        "/api/chat",
+        json={"persona_id": "lan", "question": "đơn xin nghỉ phép như nào", "as_of": "2026-10-08"},
+    ).json()
+    assert form["outcome"] == "no_policy"
+    assert form["llm_used"] is True
+    assert form["sources"] == []
+    assert "14 ngày" not in form["answer"]
+    assert "APT-LV-014" not in form["answer"]
+
+    annual = client.post(
+        "/api/chat",
+        json={"persona_id": "lan", "question": ANNUAL, "as_of": "2026-10-08"},
+    ).json()
+    assert annual["mode"] == "policy"
+    assert "14 ngày" in annual["answer"]
+    assert annual["sources"][0]["document_id"] == "APT-LV-014"
+
+
+def test_compound_question_keeps_the_part_the_document_answers(tmp_path, monkeypatch):
+    from app.main import app, init_state
+
+    def judge(question, context):
+        del context
+        if "gửi xe" in question.casefold():
+            return {
+                "answers": True,
+                "reply": (
+                    "Theo APT-LV-014, nhân viên chính thức được 14 ngày nghỉ phép năm. "
+                    "Tài liệu không nói chỗ gửi xe."
+                ),
+            }
+        return None
+
+    monkeypatch.setattr("app.answer.understand", judge)
+    init_state(tmp_path / "demo.sqlite")
+    client = TestClient(app)
+    mixed = client.post(
+        "/api/chat",
+        json={
+            "persona_id": "lan",
+            "question": "được nghỉ phép bao lâu và gửi xe ở đâu khi đến công ty",
+            "as_of": "2026-10-08",
+        },
+    ).json()
+    assert mixed["outcome"] == "answered"
+    assert "14 ngày" in mixed["answer"]
+    assert "gửi xe" in mixed["answer"]
+    assert mixed["sources"][0]["document_id"] == "APT-LV-014"
+
+
+def test_chat_does_not_keyword_answer_when_the_model_cannot_run(tmp_path, monkeypatch):
+    from app.main import app, init_state
+
+    monkeypatch.setattr("app.answer.llm_configured", lambda: True)
+    monkeypatch.setattr("app.answer.last_error", lambda: "quota")
+    monkeypatch.setattr("app.answer.understand", lambda *args, **kwargs: None)
+    monkeypatch.setattr("app.answer.complete", lambda *args, **kwargs: None)
+    init_state(tmp_path / "demo.sqlite")
+    client = TestClient(app)
+    form = client.post(
+        "/api/chat",
+        json={"persona_id": "lan", "question": "đơn xin nghỉ phép như nào", "as_of": "2026-10-08"},
+    ).json()
+    assert form["outcome"] == "no_policy"
+    assert form["sources"] == []
+    assert "14 ngày" not in form["answer"]
+    assert "hết hạn mức" in form["answer"]
 
 
 def test_chat_answers_from_permitted_documents_only(tmp_path):
@@ -638,6 +885,36 @@ def test_library_rejects_unreadable_and_anonymous_access(tmp_path):
     )
     assert blocked_create.status_code == 403
     assert "15 ngày" not in blocked_create.text
+
+
+def test_open_chat_refuses_when_embeddings_stay_below_the_floor(tmp_path, monkeypatch):
+    from app.main import app, init_state
+
+    init_state(tmp_path / "demo.sqlite")
+
+    def orthogonal(self, documents, question):
+        del self, question
+        return {(document.version_id, 0): [1.0, 0.0] for document in documents}, [0.0, 1.0]
+
+    def refuse_llm(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("LLM was called without a conclusion")
+
+    monkeypatch.setattr(AnswerService, "_embedding_space", orthogonal)
+    monkeypatch.setattr("app.answer.complete", refuse_llm)
+    client = TestClient(app)
+    minh = client.post(
+        "/api/chat",
+        json={"persona_id": "minh", "question": "Ca kíp được nghỉ thêm thế nào?", "as_of": "2026-10-08"},
+    ).json()
+    assert minh["mode"] == "passages"
+    assert minh["outcome"] == "no_policy"
+    assert minh["llm_used"] is False
+    assert minh["sources"] == []
+    assert "ca kíp" not in minh["answer"].casefold()
+    assert "HAR-LV-009" not in minh["answer"]
+    assert "dưới ngưỡng" in minh["reason"]
+    assert any("dưới ngưỡng" in step["detail"] for step in minh["steps"])
 
 
 def test_open_chat_skips_procedures_outside_the_asker(tmp_path):

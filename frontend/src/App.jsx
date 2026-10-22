@@ -18,6 +18,12 @@ const CLEARANCE = {
   restricted: "hạn chế",
 }
 
+function formatDay(value) {
+  if (!value) return ""
+  const [year, month, day] = value.split("-")
+  return `${day}/${month}/${year}`
+}
+
 function personaLabel(persona) {
   const contract = CONTRACTS[persona.employment_type] || persona.employment_type
   const clearance = CLEARANCE[persona.clearance] || persona.clearance
@@ -34,11 +40,14 @@ export default function App() {
   const [rightId, setRightId] = useState("minh")
   const [question, setQuestion] = useState("Quy định nghỉ phép của tôi như thế nào?")
   const [asOf, setAsOf] = useState("2026-10-08")
+  const [leftAsOf, setLeftAsOf] = useState("2026-10-08")
+  const [rightAsOf, setRightAsOf] = useState("2026-10-08")
   const [left, setLeft] = useState(null)
   const [right, setRight] = useState(null)
   const [error, setError] = useState("")
   const [busy, setBusy] = useState(false)
   const [focusId, setFocusId] = useState(null)
+  const [citation, setCitation] = useState(null)
   const [libraryId, setLibraryId] = useState("lan")
 
   const libraryPersona = personas.find((persona) => persona.id === libraryId)
@@ -48,9 +57,10 @@ export default function App() {
     return new URLSearchParams({ persona_id: personaId, as_of: on }).toString()
   }
 
-  function openLibrary(versionId, personaId) {
+  function openLibrary(versionId, personaId, nextCitation = null) {
     setLibraryId(personaId)
     setFocusId(versionId)
+    setCitation(nextCitation ? { ...nextCitation, versionId } : null)
     setView("docs")
     loadDocuments(personaId, asOf)
   }
@@ -77,12 +87,15 @@ export default function App() {
       leftId: next.leftId ?? leftId,
       rightId: next.rightId ?? rightId,
       question: next.question ?? question,
-      asOf: next.asOf ?? asOf,
+      leftAsOf: next.leftAsOf ?? leftAsOf,
+      rightAsOf: next.rightAsOf ?? rightAsOf,
     }
     setLeftId(payload.leftId)
     setRightId(payload.rightId)
     setQuestion(payload.question)
-    setAsOf(payload.asOf)
+    setLeftAsOf(payload.leftAsOf)
+    setRightAsOf(payload.rightAsOf)
+    setAsOf(payload.leftAsOf)
     setBusy(true)
     setError("")
     try {
@@ -90,7 +103,9 @@ export default function App() {
         left_id: payload.leftId,
         right_id: payload.rightId,
         question: payload.question,
-        as_of: payload.asOf,
+        as_of: payload.leftAsOf,
+        left_as_of: payload.leftAsOf,
+        right_as_of: payload.rightAsOf,
       })
       setLeft(result.left)
       setRight(result.right)
@@ -147,13 +162,16 @@ export default function App() {
                 {personas.map((persona) => <option key={persona.id} value={persona.id}>{personaLabel(persona)}</option>)}
               </select>
             </label>
+            <label>Ngày hỏi bên trái
+              <input type="date" value={leftAsOf} onChange={(event) => setLeftAsOf(event.target.value)} />
+            </label>
             <label>Người bên phải
               <select value={rightId} onChange={(event) => setRightId(event.target.value)}>
                 {personas.map((persona) => <option key={persona.id} value={persona.id}>{personaLabel(persona)}</option>)}
               </select>
             </label>
-            <label>Ngày hỏi
-              <input type="date" value={asOf} onChange={(event) => setAsOf(event.target.value)} />
+            <label>Ngày hỏi bên phải
+              <input type="date" value={rightAsOf} onChange={(event) => setRightAsOf(event.target.value)} />
             </label>
             <label>Câu hỏi
               <textarea value={question} onChange={(event) => setQuestion(event.target.value)} />
@@ -165,13 +183,17 @@ export default function App() {
           <section className="results">
             {error ? <p className="banner error">{error}</p> : null}
             {left && right && left.as_of !== right.as_of ? (
-              <p className="banner">Cùng một người, hai ngày hiệu lực: {left.as_of} và {right.as_of}.</p>
+              <p className="banner">
+                {left.persona.id === right.persona.id
+                  ? `${left.persona.name} ở hai ngày hiệu lực: ${formatDay(left.as_of)} và ${formatDay(right.as_of)}.`
+                  : `Hai ngày hiệu lực: ${formatDay(left.as_of)} và ${formatDay(right.as_of)}.`}
+              </p>
             ) : null}
             {left && right ? (
-              <>
-                <AnswerCard result={left} onOpen={(versionId) => openLibrary(versionId, left.persona.id)} />
-                <AnswerCard result={right} onOpen={(versionId) => openLibrary(versionId, right.persona.id)} />
-              </>
+              <div className="compare">
+                <AnswerCard result={left} onOpen={(versionId, nextCitation) => openLibrary(versionId, left.persona.id, nextCitation)} />
+                <AnswerCard result={right} onOpen={(versionId, nextCitation) => openLibrary(versionId, right.persona.id, nextCitation)} />
+              </div>
             ) : !error ? <div className="empty">Đang lấy câu trả lời...</div> : null}
           </section>
         </main>
@@ -197,9 +219,10 @@ export default function App() {
           personaId={libraryId}
           asOf={asOf}
           canManage={canManage}
-          onPersonaChange={(id) => { setFocusId(null); setLibraryId(id); loadDocuments(id, asOf) }}
+          onPersonaChange={(id) => { setDocuments([]); setLibraryId(id); loadDocuments(id, asOf) }}
           onSaved={() => loadDocuments()}
           focusId={focusId}
+          citation={citation}
         />
       ) : <p className="banner error">Chưa tải được danh mục tài liệu.</p>}
     </div>

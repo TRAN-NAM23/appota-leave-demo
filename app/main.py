@@ -99,6 +99,8 @@ class CompareRequest(BaseModel):
     right_id: str
     question: str = Field(min_length=1)
     as_of: date
+    left_as_of: date | None = None
+    right_as_of: date | None = None
 
 
 class DocumentRequest(BaseModel):
@@ -238,8 +240,8 @@ def compare(request: CompareRequest) -> dict:
     if left is None or right is None:
         raise HTTPException(status_code=404, detail="Không có người dùng này trong dữ liệu giả lập.")
     return {
-        "left": service.ask(left, request.question, request.as_of),
-        "right": service.ask(right, request.question, request.as_of),
+        "left": service.ask(left, request.question, request.left_as_of or request.as_of),
+        "right": service.ask(right, request.question, request.right_as_of or request.as_of),
     }
 
 

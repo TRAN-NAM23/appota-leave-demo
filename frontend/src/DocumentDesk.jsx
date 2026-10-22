@@ -81,7 +81,19 @@ function formFromDocument(document, topics) {
   }
 }
 
-export default function DocumentDesk({ catalog, documents, onSaved, focusId, personaId, asOf, canManage, personas, onPersonaChange }) {
+function CitedContent({ content, text }) {
+  const index = text ? content.indexOf(text) : -1
+  if (index < 0) return <pre className="doc-read">{content}</pre>
+  return (
+    <pre className="doc-read">
+      {content.slice(0, index)}
+      <mark>{content.slice(index, index + text.length)}</mark>
+      {content.slice(index + text.length)}
+    </pre>
+  )
+}
+
+export default function DocumentDesk({ catalog, documents, onSaved, focusId, citation, personaId, asOf, canManage, personas, onPersonaChange }) {
   const formCard = useRef(null)
   const [form, setForm] = useState(EMPTY)
   const [query, setQuery] = useState("")
@@ -92,22 +104,43 @@ export default function DocumentDesk({ catalog, documents, onSaved, focusId, per
   const [confirming, setConfirming] = useState(false)
   const [opened, setOpened] = useState(null)
   const [openError, setOpenError] = useState("")
+  const requestId = useRef(0)
+  const personaKey = useRef(personaId)
+
+  if (personaKey.current !== personaId) {
+    personaKey.current = personaId
+    requestId.current += 1
+    setOpened(null)
+    setForm(EMPTY)
+    setOpenError("")
+  }
 
   useEffect(() => {
     if (focusId) openVersion(focusId)
-  }, [focusId])
+  }, [focusId, personaId])
+
+  useEffect(() => {
+    if (!opened || citation?.versionId !== opened.version_id) return
+    document.querySelector(".doc-read mark")?.scrollIntoView({ block: "center" })
+  }, [opened, citation])
 
   async function openVersion(versionId) {
+    const current = ++requestId.current
     setOpenError("")
     setConfirming(false)
+    setOpened(null)
+    setForm(EMPTY)
     try {
       const params = new URLSearchParams({ persona_id: personaId, as_of: asOf })
       const detail = await request(`/api/documents/${encodeURIComponent(versionId)}?${params}`)
+      if (current !== requestId.current) return
       setOpened(detail)
       setForm(formFromDocument(detail, catalog.topics))
       formCard.current?.scrollIntoView({ block: "start" })
     } catch (error) {
+      if (current !== requestId.current) return
       setOpened(null)
+      setForm(EMPTY)
       setOpenError(error.message)
     }
   }
@@ -207,6 +240,14 @@ export default function DocumentDesk({ catalog, documents, onSaved, focusId, per
             </select>
           </label>
         </div>
+        {opened && citation?.versionId === opened.version_id ? (
+          <div className="cited-doc">
+            {citation.used === false ? (
+              <p className="banner">Không được dùng cho câu trả lời này.</p>
+            ) : <p className="kicker">Đoạn đã trích</p>}
+            <CitedContent content={opened.content} text={citation.text} />
+          </div>
+        ) : null}
         <div className="actions">
           {opened ? null : <p className="lede">Thư viện chỉ hiện tài liệu người này được đọc.</p>}
           {opened ? (

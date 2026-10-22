@@ -3,10 +3,10 @@ from __future__ import annotations
 import re
 from datetime import date
 
-from app.catalog import TOPIC_LABELS
+from app.catalog import KIND_LABELS, TOPIC_LABELS
 from app.db import write_audit
 from app.embed import embed_texts, ensure_statement_embeddings
-from app.llm import complete
+from app.llm import complete, last_error, llm_configured, understand
 from app.models import Document, User
 from app.policy import Decision, PolicyEngine
 from app.retrieve import chunks_for_answer, passages_for_question, query_terms, rank_statements, readable_effective
@@ -100,6 +100,7 @@ class AnswerService:
         llm_used = False
         steps = [self._identity_step(user)]
         passages: list[dict] = []
+        fits = True
         if topic is None:
             answer = "Bản demo này trả lời các câu hỏi về nghỉ phép, làm việc từ xa, lương và thưởng."
             steps.extend([
@@ -121,14 +122,26 @@ class AnswerService:
                 "title": "Chọn công cụ",
                 "detail": f"Câu thuộc {TOPIC_LABELS.get(topic, topic)}. Policy chọn bản hiệu lực, RAG chỉ lấy đoạn trong tập đó.",
             })
-            steps.append(self._policy_step(decision))
+            steps.append(self._policy_step(user, decision))
             passages = self._policy_passages(question, decision)
             steps.append(self._retrieve_step(passages))
             chunks = chunks_for_answer(self.engine, user, question, on, decision)
             cited_chunks = self._tag_chunks(decision, chunks)
-            answer, llm_used = self._compose(question, decision, cited_chunks)
-            steps.append(self._compose_step(decision, llm_used))
-        payload = self._public(user, question, on, topic, decision, answer, llm_used, steps, passages)
+            answer, llm_used, fits = self._compose(user, question, decision, cited_chunks)
+            if fits:
+                steps.append(self._compose_step(decision, llm_used))
+            else:
+                decision = Decision(outcome="no_policy")
+                passages = []
+                steps.append({
+                    "tool": "compose",
+                    "title": "Viết câu trả lời",
+                    "detail": "Agent đã hiểu câu hỏi. Đoạn được phép không trả lời đúng việc đó.",
+                })
+        mismatch = None if fits else "Agent đã đọc câu hỏi. Tài liệu được phép không trả lời đúng việc đang hỏi."
+        payload = self._public(
+            user, question, on, topic, decision, answer, llm_used, steps, passages, mismatch,
+        )
         if self.db_path is not None:
             write_audit(
                 self.db_path,
@@ -165,6 +178,8 @@ class AnswerService:
         topic = detect_topic(question, extra)
         if topic:
             payload = self.ask(user, question, on)
+            if self._model_failed(payload):
+                return self._model_unavailable(user, question, on)
             sources = [
                 item
                 for item in [payload["winner"], *payload["supplements"]]
@@ -172,7 +187,7 @@ class AnswerService:
             ]
             if payload["outcome"] == "conflict":
                 decision = self.engine.resolve_effective(user, topic, on)
-                sources = [self._source(document) for document in decision.conflicts]
+                sources = [self._source(user, document) for document in decision.conflicts]
             return {
                 "mode": "policy",
                 "outcome": payload["outcome"],
@@ -190,12 +205,16 @@ class AnswerService:
         allowed = readable_effective(self.engine, user, on)
         vectors, query_vector = self._embedding_space(allowed, question)
         method, ranked = rank_statements(allowed, question, vectors, query_vector, floor=0.28)
-        if method == "embedding":
+        below_floor = method == "embedding" and not ranked
+        if method == "embedding" and ranked:
             cited = [(document, document.statement) for _score, _item_method, document in ranked]
             passage_rows = [
                 self._passage(document, score, item_method, True)
                 for score, item_method, document in ranked
             ]
+        elif below_floor:
+            cited = []
+            passage_rows = []
         else:
             cited = passages_for_question(self.engine, user, question, on)
             passage_rows = [
@@ -216,42 +235,75 @@ class AnswerService:
             },
             self._retrieve_step(passage_rows),
         ]
+        if below_floor:
+            steps[-1] = {
+                "tool": "retrieve",
+                "title": "RAG",
+                "detail": "Đã so embedding. Không có đoạn nào đạt ngưỡng để dùng.",
+            }
         if not cited:
-            answer = (
-                "Chưa thấy căn cứ trong các tài liệu bạn được phép xem và còn hiệu lực. "
-                "Hãy hỏi theo đúng đơn vị của bạn hoặc bổ sung tài liệu."
-            )
-            reason = "Không có đoạn tài liệu được phép dùng cho câu hỏi này."
+            if below_floor:
+                answer = (
+                    "Đã tìm trong các tài liệu bạn được phép xem và còn hiệu lực. "
+                    "Không có đoạn nào đủ gần với câu hỏi để kết luận."
+                )
+                reason = "Các đoạn gần nhất đều dưới ngưỡng, nên không dùng và không gọi LLM."
+            else:
+                answer = (
+                    "Chưa thấy căn cứ trong các tài liệu bạn được phép xem và còn hiệu lực. "
+                    "Hãy hỏi theo đúng đơn vị của bạn hoặc bổ sung tài liệu."
+                )
+                reason = "Không có đoạn tài liệu được phép dùng cho câu hỏi này."
             outcome = "no_policy"
             llm_used = False
             steps.append({
                 "tool": "compose",
                 "title": "Viết câu trả lời",
-                "detail": "Không gọi LLM vì không có đoạn được phép.",
+                "detail": (
+                    "Không gọi LLM vì các đoạn gần nhất đều dưới ngưỡng."
+                    if below_floor
+                    else "Không gọi LLM vì không có đoạn được phép."
+                ),
             })
         else:
             fallback = self._passages_fallback(cited)
-            generated = complete(question, build_context(cited))
-            allowed_ids = {document.document_id for document, _chunk in cited}
-            if generated and citations_ok(generated, allowed_ids):
-                answer = generated
+            judged = understand(question, build_context(cited))
+            reply = "" if judged is None else judged["reply"]
+            if judged is None and self._model_failed({"llm_used": False, "outcome": "answered"}):
+                answer = self._model_unavailable_text()
+                llm_used = False
+                outcome = "no_policy"
+                cited = []
+                passage_rows = []
+                reason = answer
+                detail = "Không gọi được mô hình nên không trả lời theo từ khóa."
+            elif judged is not None and not judged["answers"]:
+                answer = reply
                 llm_used = True
+                outcome = "no_policy"
+                cited = []
+                passage_rows = []
+                reason = "Agent đã đọc câu hỏi. Các đoạn tìm được không trả lời đúng việc đang hỏi."
+                detail = "Agent đã hiểu câu hỏi. Đoạn được phép không trả lời đúng việc đó."
+            elif judged is not None and judged["answers"]:
+                answer = reply
+                llm_used = True
+                outcome = "answered"
+                reason = "Các đoạn này thuộc tài liệu bạn được xem và còn hiệu lực vào ngày hỏi."
+                detail = "Agent trả lời phần có căn cứ và nói rõ phần tài liệu không đề cập."
             else:
                 answer = fallback
                 llm_used = False
-            reason = "Các đoạn này thuộc tài liệu bạn được xem và còn hiệu lực vào ngày hỏi."
-            outcome = "answered"
-            steps.append({
-                "tool": "compose",
-                "title": "Viết câu trả lời",
-                "detail": "LLM diễn đạt các đoạn RAG đã lấy." if llm_used else "Dùng câu trích từ các đoạn RAG đã lấy.",
-            })
+                outcome = "answered"
+                reason = "Các đoạn này thuộc tài liệu bạn được xem và còn hiệu lực vào ngày hỏi."
+                detail = "Dùng câu trích từ các đoạn RAG đã lấy."
+            steps.append({"tool": "compose", "title": "Viết câu trả lời", "detail": detail})
         payload = {
             "mode": "passages",
             "outcome": outcome,
             "answer": answer,
             "reason": reason,
-            "sources": [self._source(document) for document, _chunk in cited],
+            "sources": [self._source(user, document) for document, _chunk in cited],
             "persona": self._persona(user),
             "as_of": on.isoformat(),
             "question": question,
@@ -281,6 +333,37 @@ class AnswerService:
             )
         return payload
 
+    def _model_failed(self, payload: dict) -> bool:
+        return bool(llm_configured() and last_error() and not payload["llm_used"] and payload["outcome"] == "answered")
+
+    def _model_unavailable_text(self) -> str:
+        if last_error() == "quota":
+            return "Agent chưa hiểu được câu hỏi vì khóa API của mô hình đã hết hạn mức."
+        return "Agent chưa hiểu được câu hỏi vì không gọi được mô hình."
+
+    def _model_unavailable(self, user: User, question: str, on: date) -> dict:
+        answer = self._model_unavailable_text()
+        return {
+            "mode": "passages",
+            "outcome": "no_policy",
+            "answer": answer,
+            "reason": answer,
+            "sources": [],
+            "persona": self._persona(user),
+            "as_of": on.isoformat(),
+            "question": question,
+            "llm_used": False,
+            "steps": [
+                self._identity_step(user),
+                {
+                    "tool": "compose",
+                    "title": "Viết câu trả lời",
+                    "detail": "Không gọi được mô hình nên không trả lời theo từ khóa.",
+                },
+            ],
+            "passages": [],
+        }
+
     def _identity_step(self, user: User) -> dict:
         roles = ", ".join(ROLE_LABELS.get(role.role, role.role) for role in user.roles)
         contract = CONTRACT_LABELS.get(user.employment_type, user.employment_type)
@@ -290,7 +373,7 @@ class AnswerService:
             "detail": f"{user.name} · {self.engine.corpus.org_name(user.org)} · {roles} · {contract} · mức {user.clearance}.",
         }
 
-    def _policy_step(self, decision: Decision) -> dict:
+    def _policy_step(self, user: User, decision: Decision) -> dict:
         hidden = len(decision.hidden_rejected)
         hidden_note = f" Đã loại {hidden} tài liệu ngoài quyền xem." if hidden else ""
         if decision.outcome == "answered" and decision.winner is not None:
@@ -298,7 +381,7 @@ class AnswerService:
         elif decision.outcome == "conflict":
             detail = f"Các bản cùng cấp đang xung đột, không tự chọn.{hidden_note}"
         else:
-            detail = f"Không có tài liệu vừa được xem, vừa áp dụng, vừa còn hiệu lực.{hidden_note}"
+            detail = f"{self._access_gap(user, decision)}{hidden_note}"
         return {"tool": "policy", "title": "Policy Engine", "detail": detail}
 
     def _retrieve_step(self, passages: list[dict]) -> dict:
@@ -363,6 +446,7 @@ class AnswerService:
             "document_id": document.document_id,
             "version": document.version,
             "title": document.title,
+            "statement": document.statement,
             "excerpt": excerpt,
             "score": shown,
             "method": method,
@@ -375,16 +459,21 @@ class AnswerService:
             lines.append(f"- {self._cite(document)}: {chunk}")
         return "\n".join(lines)
 
-    def _compose(self, question: str, decision: Decision, cited_chunks: list[tuple[Document, str]]) -> tuple[str, bool]:
-        fallback = self._fallback(decision)
+    def _compose(self, user: User, question: str, decision: Decision, cited_chunks: list[tuple[Document, str]]) -> tuple[str, bool, bool]:
+        fallback = self._fallback(user, decision)
         if decision.outcome != "answered":
-            return fallback, False
+            return fallback, False, True
         context = build_context(cited_chunks)
-        generated = complete(question, context)
-        allowed_ids = {document.document_id for document, _chunk in cited_chunks}
-        if generated and citations_ok(generated, allowed_ids):
-            return generated, True
-        return fallback, False
+        judged = understand(question, context)
+        if judged is None:
+            generated = complete(question, context)
+            allowed_ids = {document.document_id for document, _chunk in cited_chunks}
+            if generated and citations_ok(generated, allowed_ids):
+                return generated, True, True
+            return fallback, False, True
+        if not judged["answers"]:
+            return judged["reply"], True, False
+        return judged["reply"], True, True
 
     def _tag_chunks(self, decision: Decision, chunks: list[str]) -> list[tuple[Document, str]]:
         owned: list[tuple[Document, str]] = []
@@ -395,12 +484,9 @@ class AnswerService:
                 owned.append((owner, chunk))
         return owned
 
-    def _fallback(self, decision: Decision) -> str:
+    def _fallback(self, user: User, decision: Decision) -> str:
         if decision.outcome == "no_policy":
-            return (
-                "Chưa có quy định đang hiệu lực cho đơn vị và loại hợp đồng của bạn. "
-                "Hãy hỏi Phòng Nhân sự của đơn vị."
-            )
+            return self._access_gap(user, decision)
         if decision.outcome == "conflict":
             lines = ["Chưa thể kết luận vì có nhiều quy định cùng cấp đang cùng hiệu lực.", ""]
             for document in decision.conflicts:
@@ -409,12 +495,9 @@ class AnswerService:
             return "\n".join(lines)
         if decision.winner is None:
             return "Chưa thể kết luận."
-        lines = [decision.winner.statement, "", f"Nguồn: {self._cite(decision.winner)}."]
+        lines = [decision.winner.statement]
         for document in decision.supplements:
-            lines.extend(["", f"Bổ sung: {document.statement}", f"Nguồn: {self._cite(document)}."])
-        if decision.overridden:
-            replaced = ", ".join(document.key for document in decision.overridden)
-            lines.extend(["", f"Đã thay quy định cấp rộng hơn: {replaced}. Nội dung cấp rộng hơn không được dùng."])
+            lines.extend(["", document.statement])
         return "\n".join(lines)
 
     def _cite(self, document: Document) -> str:
@@ -438,22 +521,25 @@ class AnswerService:
         llm_used: bool,
         steps: list[dict] | None = None,
         passages: list[dict] | None = None,
+        reason: str | None = None,
     ) -> dict:
         return {
             "outcome": decision.outcome if topic else "unknown_topic",
             "topic": topic,
             "answer": answer,
-            "winner": None if decision.winner is None else self._source(decision.winner),
-            "supplements": [self._source(document) for document in decision.supplements],
+            "winner": None if decision.winner is None else self._source(user, decision.winner),
+            "supplements": [self._source(user, document) for document in decision.supplements],
             "overridden": [
-                {**self._card(document), "reason": REASON_LABELS["less_specific"]}
+                {**self._card(user, document), "reason": REASON_LABELS["less_specific"]}
                 for document in decision.overridden
             ],
             "visible_rejected": [
-                {**self._card(document), "reason": REASON_LABELS.get(reason, reason)}
+                {**self._card(user, document), "reason": REASON_LABELS.get(reason, reason)}
                 for document, reason in decision.visible_rejected
             ],
-            "reason": self._winner_reason(decision),
+            "stack": self._stack(user, decision),
+            "versions": self._versions(user, decision, on),
+            "reason": reason or self._winner_reason(user, decision),
             "persona": self._persona(user),
             "as_of": on.isoformat(),
             "question": question,
@@ -462,11 +548,41 @@ class AnswerService:
             "passages": passages or [],
         }
 
-    def _winner_reason(self, decision: Decision) -> str:
+    def _access_gap(self, user: User, decision: Decision) -> str:
+        hidden = {reason for _, reason in decision.hidden_rejected}
+        visible = {reason for _, reason in decision.visible_rejected}
+        contract = CONTRACT_LABELS.get(user.employment_type, user.employment_type)
+        clearance = {"internal": "nội bộ", "confidential": "mật", "restricted": "hạn chế"}.get(
+            user.clearance, user.clearance,
+        )
+        if "not_applicable" in visible:
+            return f"Có tài liệu trong tầm nhìn, nhưng không áp dụng cho loại hợp đồng {contract}."
+        if visible and visible <= {"expired", "superseded"}:
+            return "Chỉ còn bản đã hết hiệu lực, không có bản đang dùng."
+        if visible and visible <= {"not_yet_effective", "not_yet_published"}:
+            return "Bản trong tầm nhìn chưa tới ngày hiệu lực."
+        if visible and visible <= {"not_published"}:
+            return "Bản trong tầm nhìn chưa được ban hành."
+        if not hidden and not visible:
+            return "Không có tài liệu cho chủ đề này."
+        if "insufficient_clearance" in hidden:
+            return f"Không đủ mức tiếp cận. Người hỏi đang ở mức {clearance}."
+        if "role_forbidden" in hidden:
+            roles = ", ".join(ROLE_LABELS.get(role.role, role.role) for role in user.roles)
+            return f"Vai trò hiện tại ({roles}) không được đọc quy định này."
+        if "denied" in hidden:
+            return "Quy định này đang bị cấm với người hỏi."
+        if "out_of_audience" in hidden:
+            return "Không có quy định trong phạm vi đơn vị của người hỏi."
+        if "draft_forbidden" in hidden:
+            return "Bản liên quan còn là dự thảo và nằm ngoài quyền xem."
+        return "Không có tài liệu vừa được phép xem, vừa áp dụng, vừa còn hiệu lực."
+
+    def _winner_reason(self, user: User, decision: Decision) -> str:
         if decision.outcome == "conflict":
             return "Hai quy định cùng cấp đang cùng hiệu lực, nên hệ thống không tự chọn."
         if decision.outcome == "no_policy":
-            return "Không có tài liệu vừa được phép xem, vừa áp dụng, vừa còn hiệu lực."
+            return self._access_gap(user, decision)
         if decision.outcome != "answered":
             return "Câu hỏi chưa thuộc chủ đề mà bản demo đang hỗ trợ."
         if decision.supplements:
@@ -477,20 +593,117 @@ class AnswerService:
             return "Bản của cấp gần người hỏi hơn đang có hiệu lực và thay bản cấp rộng hơn."
         return "Đây là bản đã ban hành, còn hiệu lực và áp dụng cho người hỏi."
 
-    def _source(self, document: Document) -> dict:
-        card = self._card(document)
+    def _versions(self, user: User, decision: Decision, on: date) -> list[dict]:
+        if decision.winner is None:
+            return []
+        reasons = {
+            document.version_id: reason
+            for document, reason in (*decision.visible_rejected, *decision.hidden_rejected)
+        }
+        rows = []
+        family = [
+            document
+            for document in self.engine.corpus.documents
+            if document.document_id == decision.winner.document_id
+        ]
+        for document in sorted(family, key=lambda item: item.version):
+            access = self.engine.can_read(user, document, "read", on)
+            current = document.version_id == decision.winner.version_id
+            reason_code = reasons.get(document.version_id)
+            row = {
+                "version_id": document.version_id,
+                "document_id": document.document_id,
+                "version": document.version,
+                "status": document.status,
+                "effective_from": document.effective_from.isoformat(),
+                "effective_to": document.effective_to.isoformat() if document.effective_to else None,
+                "mark": "current" if current else "other",
+                "reason": "Đang dùng vào ngày hỏi" if current else REASON_LABELS.get(reason_code, reason_code or "Không dùng"),
+                "readable": access.allowed,
+            }
+            if access.allowed:
+                row["title"] = document.title
+                row["owner"] = self.engine.corpus.org_name(document.owner_org)
+            rows.append(row)
+        return rows
+
+    def _stack(self, user: User, decision: Decision) -> list[dict]:
+        if decision.outcome == "conflict":
+            return [
+                self._stack_row(user, document, "conflict", "Cùng cấp, không được chọn")
+                for document in decision.conflicts
+            ]
+        if decision.winner is None:
+            return []
+        rows = [
+            self._stack_row(user, document, "replaced", "Bị cấp gần hơn thay")
+            for document in sorted(decision.overridden, key=lambda item: self._audience_depth(user, item))
+        ]
+        if decision.winner.override_mode == "mandatory":
+            current_label = "Mức bắt buộc"
+            supplement_label = "Chỉ được bổ sung, không thay mức sàn"
+        else:
+            current_label = "Đang dùng"
+            supplement_label = "Bổ sung thêm điều khoản"
+        rows.append(self._stack_row(user, decision.winner, "current", current_label))
+        rows.extend(
+            self._stack_row(user, document, "supplement", supplement_label)
+            for document in decision.supplements
+        )
+        return rows
+
+    def _stack_row(self, user: User, document: Document, place: str, label: str) -> dict:
+        row = self._source(user, document)
+        row["place"] = place
+        row["label"] = label
+        return row
+
+    def _source(self, user: User, document: Document) -> dict:
+        card = self._card(user, document)
         card["statement"] = document.statement
-        card["owner"] = self.engine.corpus.org_name(document.owner_org)
-        card["effective_from"] = document.effective_from.isoformat()
-        card["effective_to"] = document.effective_to.isoformat() if document.effective_to else None
         return card
 
-    def _card(self, document: Document) -> dict:
+    def _card(self, user: User, document: Document) -> dict:
+        level, level_label, audience_name = self._audience(user, document)
         return {
             "document_id": document.document_id,
             "version": document.version,
             "title": document.title,
+            "status": document.status,
+            "owner": self.engine.corpus.org_name(document.owner_org),
+            "effective_from": document.effective_from.isoformat(),
+            "effective_to": document.effective_to.isoformat() if document.effective_to else None,
+            "override_mode": document.override_mode,
+            "level": level,
+            "level_label": level_label,
+            "audience_name": audience_name,
         }
+
+    def _audience(self, user: User, document: Document) -> tuple[str, str, str]:
+        orgs = [
+            self.engine.corpus.orgs[org_id]
+            for org_id in document.audience_orgs
+            if org_id in self.engine.corpus.orgs
+        ]
+        covering = [
+            org
+            for org in orgs
+            if user.org == org.id or user.org.startswith(org.id + "/")
+        ]
+        if covering:
+            orgs = covering
+        if not orgs:
+            return "", "", ""
+        org = max(orgs, key=lambda item: item.id.count("/"))
+        return org.kind, KIND_LABELS.get(org.kind, org.kind), org.name
+
+    def _audience_depth(self, user: User, document: Document) -> int:
+        orgs = [
+            org_id
+            for org_id in document.audience_orgs
+            if user.org == org_id or user.org.startswith(org_id + "/")
+        ] or list(document.audience_orgs)
+        return max(org_id.count("/") for org_id in orgs)
 
     def _persona(self, user: User) -> dict:
         chain = " / ".join(org.name for org in self.engine.corpus.ancestors(user.org))
